@@ -41,6 +41,7 @@ export class StatusServer {
    * @param {object} [opts.config] — Bridge config (pubkeyHex, endpoint, meshId)
    * @param {object} [opts.bsvNodeClient] — BSV P2P node client (2.26)
    * @param {object} [opts.store] — PersistentStore for wallet balance (2.27)
+   * @param {object} [opts.addressWatcher] — AddressWatcher for local UTXO tracking
    */
   constructor (opts = {}) {
     this._port = opts.port || 9333
@@ -53,6 +54,7 @@ export class StatusServer {
     this._peerHealth = opts.peerHealth || null
     this._bsvNodeClient = opts.bsvNodeClient || null
     this._store = opts.store || null
+    this._addressWatcher = opts.addressWatcher || null
     this._performOutboundHandshake = opts.performOutboundHandshake || null
     this._registeredPubkeys = opts.registeredPubkeys || null
     this._gossipManager = opts.gossipManager || null
@@ -1354,29 +1356,41 @@ export class StatusServer {
       return
     }
 
-    // GET /api/address/:addr/unspent — UTXO lookup via GorillaPool ordinals
+    // GET /api/address/:addr/unspent — local store first, GorillaPool fallback
     const unspentMatch = path.match(/^\/api\/address\/([13][a-km-zA-HJ-NP-Z1-9]{24,33})\/unspent$/)
     if (req.method === 'GET' && unspentMatch) {
       const addr = unspentMatch[1]
-      try {
-        const resp = await fetch(
-          `https://ordinals.gorillapool.io/api/txos/address/${addr}/unspent`,
-          { signal: AbortSignal.timeout(10000) }
-        )
-        if (!resp.ok) throw new Error(`GorillaPool ${resp.status}`)
-        const data = await resp.json()
-        // Transform GorillaPool format → WoC format
-        const utxos = data.map(u => ({
-          tx_hash: u.txid,
-          tx_pos: u.vout,
-          value: u.satoshis
-        }))
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify(utxos))
-      } catch (err) {
-        res.writeHead(502, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'UTXO fetch failed: ' + err.message }))
+
+      // Auto-watch this address so future P2P txs are tracked locally
+      if (this._addressWatcher) {
+        try { this._addressWatcher.watchAddress(addr) } catch {}
       }
+
+      // Query both local store and GorillaPool in parallel, merge, dedupe
+      const localPromise = this._store
+        ? this._store.getUnspentByAddress(addr).catch(() => [])
+        : Promise.resolve([])
+      const gpPromise = fetch(
+        `https://ordinals.gorillapool.io/api/txos/address/${addr}/unspent`,
+        { signal: AbortSignal.timeout(10000) }
+      ).then(r => r.ok ? r.json() : []).catch(() => [])
+
+      const [localUtxos, gpData] = await Promise.all([localPromise, gpPromise])
+
+      // Merge and dedupe by outpoint (txid:vout)
+      const seen = new Set()
+      const merged = []
+      for (const u of localUtxos) {
+        const key = `${u.txid}:${u.vout}`
+        if (!seen.has(key)) { seen.add(key); merged.push({ tx_hash: u.txid, tx_pos: u.vout, value: u.satoshis }) }
+      }
+      for (const u of gpData) {
+        const key = `${u.txid}:${u.vout}`
+        if (!seen.has(key)) { seen.add(key); merged.push({ tx_hash: u.txid, tx_pos: u.vout, value: u.satoshis }) }
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify(merged))
       return
     }
 
@@ -1388,6 +1402,13 @@ export class StatusServer {
       // Mempool first
       if (this._txRelay && this._txRelay.mempool.has(txid)) {
         rawHex = this._txRelay.mempool.get(txid)
+      }
+      // Local PersistentStore (broadcast-tracked txs)
+      if (!rawHex && this._store) {
+        try {
+          const stored = await this._store.getTx(txid)
+          if (stored) rawHex = stored
+        } catch {}
       }
       // P2P second
       if (!rawHex && this._bsvNodeClient) {
@@ -1431,6 +1452,21 @@ export class StatusServer {
       const hash = createHash('sha256').update(createHash('sha256').update(buf).digest()).digest()
       const txid = Buffer.from(hash).reverse().toString('hex')
       const sent = this._txRelay ? this._txRelay.broadcastTx(txid, rawHex) : 0
+      // Store raw tx in PersistentStore so /api/tx/{txid}/hex can serve it later
+      if (this._store) {
+        try { await this._store.putTx(txid, rawHex) } catch {}
+      }
+      // Feed into AddressWatcher so local UTXO store tracks watched addresses
+      if (this._addressWatcher) {
+        try { await this._addressWatcher.processTxManual(rawHex) } catch {}
+      }
+      // Forward to ARC (fire-and-forget) so tx reaches miners
+      fetch('https://arc.gorillapool.io/v1/tx', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: buf,
+        signal: AbortSignal.timeout(5000)
+      }).catch(() => {})
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ txid, peers: sent }))
       return
@@ -1484,40 +1520,99 @@ export class StatusServer {
       return
     }
 
-    // GET /api/address/:addr/balance — sum UTXOs from GorillaPool (web app compat)
+    // GET /api/address/:addr/balance — local store first, GorillaPool fallback
     const apiBalMatch = path.match(/^\/api\/address\/([13][a-km-zA-HJ-NP-Z1-9]{24,33})\/balance$/)
     if (req.method === 'GET' && apiBalMatch) {
       const addr = apiBalMatch[1]
-      try {
-        const resp = await fetch(
-          `https://ordinals.gorillapool.io/api/txos/address/${addr}/unspent`,
-          { signal: AbortSignal.timeout(10000) }
-        )
-        if (!resp.ok) throw new Error(`GorillaPool ${resp.status}`)
-        const data = await resp.json()
-        const confirmed = data.reduce((sum, u) => sum + (u.satoshis || 0), 0)
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ confirmed, unconfirmed: 0 }))
-      } catch (err) {
-        res.writeHead(502, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Balance fetch failed: ' + err.message }))
+
+      // Auto-watch
+      if (this._addressWatcher) {
+        try { this._addressWatcher.watchAddress(addr) } catch {}
       }
+
+      // Query both sources in parallel, merge, dedupe, sum
+      const localBal = this._store
+        ? this._store.getUnspentByAddress(addr).catch(() => [])
+        : Promise.resolve([])
+      const gpBal = fetch(
+        `https://ordinals.gorillapool.io/api/txos/address/${addr}/unspent`,
+        { signal: AbortSignal.timeout(10000) }
+      ).then(r => r.ok ? r.json() : []).catch(() => [])
+
+      const [localUtxos, gpData] = await Promise.all([localBal, gpBal])
+      const seen = new Set()
+      let confirmed = 0
+      for (const u of localUtxos) {
+        const key = `${u.txid}:${u.vout}`
+        if (!seen.has(key)) { seen.add(key); confirmed += u.satoshis || 0 }
+      }
+      for (const u of gpData) {
+        const key = `${u.txid}:${u.vout}`
+        if (!seen.has(key)) { seen.add(key); confirmed += u.satoshis || 0 }
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ confirmed, unconfirmed: 0 }))
       return
     }
 
-    // GET /api/tx/:txid — full tx JSON via WoC (web app compat)
+    // GET /api/tx/:txid — parsed tx JSON from bridge data (mempool/store/P2P)
     const apiTxMatch = path.match(/^\/api\/tx\/([0-9a-f]{64})$/)
     if (req.method === 'GET' && apiTxMatch) {
       const txid = apiTxMatch[1]
+      let rawHex = null
+      // Mempool first
+      if (this._txRelay && this._txRelay.mempool.has(txid)) {
+        rawHex = this._txRelay.mempool.get(txid)
+      }
+      // Local PersistentStore
+      if (!rawHex && this._store) {
+        try {
+          const stored = await this._store.getTx(txid)
+          if (stored) rawHex = stored
+        } catch {}
+      }
+      // P2P
+      if (!rawHex && this._bsvNodeClient) {
+        try {
+          const result = await this._bsvNodeClient.getTx(txid, 5000)
+          rawHex = result.rawHex
+        } catch {}
+      }
+      if (!rawHex) {
+        res.writeHead(404, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'tx not found' }))
+        return
+      }
       try {
-        const resp = await fetch(`https://api.whatsonchain.com/v1/bsv/main/tx/${txid}`, { signal: AbortSignal.timeout(10000) })
-        if (!resp.ok) throw new Error('WoC returned ' + resp.status)
-        const data = await resp.json()
+        const buf = Buffer.from(rawHex, 'hex')
+        let pos = 4
+        const readVarint = () => {
+          const first = buf[pos++]
+          if (first < 0xfd) return first
+          if (first === 0xfd) { const v = buf.readUInt16LE(pos); pos += 2; return v }
+          if (first === 0xfe) { const v = buf.readUInt32LE(pos); pos += 4; return v }
+          const v = Number(buf.readBigUInt64LE(pos)); pos += 8; return v
+        }
+        const inCount = readVarint()
+        for (let i = 0; i < inCount; i++) {
+          pos += 32 + 4
+          const scriptLen = readVarint()
+          pos += scriptLen + 4
+        }
+        const outCount = readVarint()
+        const vout = []
+        for (let i = 0; i < outCount; i++) {
+          const satoshis = Number(buf.readBigUInt64LE(pos)); pos += 8
+          const scriptLen = readVarint()
+          const scriptHex = buf.subarray(pos, pos + scriptLen).toString('hex')
+          pos += scriptLen
+          vout.push({ value: satoshis / 1e8, n: i, scriptPubKey: { hex: scriptHex } })
+        }
         res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify(data))
+        res.end(JSON.stringify({ txid, vout }))
       } catch (err) {
-        res.writeHead(502, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'tx fetch failed: ' + err.message }))
+        res.writeHead(500, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'tx parse failed: ' + err.message }))
       }
       return
     }
