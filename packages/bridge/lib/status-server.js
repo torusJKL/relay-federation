@@ -1377,14 +1377,12 @@ export class StatusServer {
 
       const [localUtxos, gpData] = await Promise.all([localPromise, gpPromise])
 
-      // Merge and dedupe by outpoint (txid:vout)
+      // GP is authoritative — it tracks the real UTXO set.
+      // Local store only used as fallback when GP is down/empty.
       const seen = new Set()
       const merged = []
-      for (const u of localUtxos) {
-        const key = `${u.txid}:${u.vout}`
-        if (!seen.has(key)) { seen.add(key); merged.push({ tx_hash: u.txid, tx_pos: u.vout, value: u.satoshis }) }
-      }
-      for (const u of gpData) {
+      const source = gpData.length > 0 ? gpData : localUtxos
+      for (const u of source) {
         const key = `${u.txid}:${u.vout}`
         if (!seen.has(key)) { seen.add(key); merged.push({ tx_hash: u.txid, tx_pos: u.vout, value: u.satoshis }) }
       }
@@ -1540,13 +1538,12 @@ export class StatusServer {
       ).then(r => r.ok ? r.json() : []).catch(() => [])
 
       const [localUtxos, gpData] = await Promise.all([localBal, gpBal])
+      // GP is authoritative — it tracks the real UTXO set.
+      // Local store only used as fallback when GP is down/empty.
       const seen = new Set()
       let confirmed = 0
-      for (const u of localUtxos) {
-        const key = `${u.txid}:${u.vout}`
-        if (!seen.has(key)) { seen.add(key); confirmed += u.satoshis || 0 }
-      }
-      for (const u of gpData) {
+      const source = gpData.length > 0 ? gpData : localUtxos
+      for (const u of source) {
         const key = `${u.txid}:${u.vout}`
         if (!seen.has(key)) { seen.add(key); confirmed += u.satoshis || 0 }
       }
