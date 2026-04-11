@@ -44,6 +44,7 @@ export class PersistentStore extends EventEmitter {
     this._tokens = null
     this._sessions = null
     this._paymentReceipts = null
+    this._spentInputs = null
     this._contentDir = join(dataDir, 'content')
   }
 
@@ -65,6 +66,7 @@ export class PersistentStore extends EventEmitter {
     this._tokens = this.db.sublevel('tokens', { valueEncoding: 'json' })
     this._sessions = this.db.sublevel('sessions', { valueEncoding: 'json' })
     this._paymentReceipts = this.db.sublevel('payment_receipts', { valueEncoding: 'json' })
+    this._spentInputs = this.db.sublevel('spentInputs', { valueEncoding: 'json' })
     await mkdir(this._contentDir, { recursive: true })
     this.emit('open')
   }
@@ -240,6 +242,19 @@ export class PersistentStore extends EventEmitter {
   }
 
   /**
+   * Get unspent UTXOs for a specific address.
+   * @param {string} address
+   * @returns {Promise<Array<{ txid: string, vout: number, satoshis: number, scriptHex: string, address: string }>>}
+   */
+  async getUnspentByAddress (address) {
+    const utxos = []
+    for await (const [, utxo] of this._utxos.iterator()) {
+      if (!utxo.spent && utxo.address === address) utxos.push(utxo)
+    }
+    return utxos
+  }
+
+  /**
    * Get total unspent balance in satoshis.
    * @returns {Promise<number>}
    */
@@ -249,6 +264,52 @@ export class PersistentStore extends EventEmitter {
       if (!utxo.spent) total += utxo.satoshis
     }
     return total
+  }
+
+  // ── Spent inputs (broadcast-time negative cache) ───────
+
+  /**
+   * Mark a UTXO as spent by a broadcast tx (first-writer-wins).
+   * @param {string} txid — the UTXO's txid being spent
+   * @param {number} vout — the UTXO's output index being spent
+   * @param {string} spentByTxid — the spending tx's txid
+   */
+  async markInputSpent (txid, vout, spentByTxid) {
+    const key = `${txid}:${vout}`
+    try {
+      const existing = await this._spentInputs.get(key)
+      if (existing) return // first-writer-wins
+    } catch {}
+    await this._spentInputs.put(key, { spentByTxid, timestamp: Date.now() })
+  }
+
+  /**
+   * Check if a UTXO has been marked as spent by a local broadcast.
+   * @param {string} txid
+   * @param {number} vout
+   * @returns {Promise<boolean>}
+   */
+  async isInputSpent (txid, vout) {
+    const key = `${txid}:${vout}`
+    try {
+      const entry = await this._spentInputs.get(key)
+      return !!entry
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * Prune spent input entries older than maxAgeMs (default 2 hours).
+   * @param {number} [maxAgeMs=7200000]
+   */
+  async pruneSpentInputs (maxAgeMs = 7200000) {
+    const cutoff = Date.now() - maxAgeMs
+    const batch = this._spentInputs.batch()
+    for await (const [key, entry] of this._spentInputs.iterator()) {
+      if (entry.timestamp < cutoff) batch.del(key)
+    }
+    await batch.write()
   }
 
   // ── Watched address matches ──────────────────────────────

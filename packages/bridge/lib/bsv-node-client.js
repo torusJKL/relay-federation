@@ -62,6 +62,13 @@ export class BSVNodeClient extends EventEmitter {
     this._destroyed = false
     this._maintainTimer = null
 
+    // Reconnect backoff: host → { until: timestamp, delay: ms }
+    this._peerCooldown = new Map()
+    this._baseCooldownMs = 5000       // 5s initial cooldown
+    this._maxCooldownMs = 300000      // 5 min cap
+    // Permanent blacklist for non-BSV peers (BCH/BTC) — never reconnect
+    this._blacklist = new Set()
+
     // Track best height across all peers
     this._bestHeight = this._checkpoint.height
     this._bestHash = this._checkpoint.hash
@@ -246,12 +253,43 @@ export class BSVNodeClient extends EventEmitter {
   // ── Private: peer management ───────────────────────────────
 
   /**
+   * Check if a host is in cooldown. Returns true if we should skip connecting.
+   */
+  _isInCooldown (host) {
+    const entry = this._peerCooldown.get(host)
+    if (!entry) return false
+    if (Date.now() < entry.until) return true
+    // Cooldown expired — allow reconnect
+    return false
+  }
+
+  /**
+   * Apply cooldown to a host with exponential backoff.
+   * @param {string} host
+   * @param {number} [overrideMs] — fixed cooldown (e.g. BCH blacklist)
+   */
+  _applyCooldown (host, overrideMs) {
+    const existing = this._peerCooldown.get(host)
+    const delay = overrideMs || (existing ? Math.min(existing.delay * 2, this._maxCooldownMs) : this._baseCooldownMs)
+    this._peerCooldown.set(host, { until: Date.now() + delay, delay })
+  }
+
+  /**
+   * Clear cooldown on successful stable connection.
+   */
+  _clearCooldown (host) {
+    this._peerCooldown.delete(host)
+  }
+
+  /**
    * Connect to a single BSV peer. Fire-and-forget.
    * @param {string} host
    * @param {number} port
    */
   async _connectToPeer (host, port) {
     if (this._peers.has(host) || this._destroyed) return
+    if (this._blacklist.has(host)) return
+    if (this._isInCooldown(host)) return
 
     const peer = new BSVPeer({
       checkpoint: this._checkpoint,
@@ -272,11 +310,16 @@ export class BSVNodeClient extends EventEmitter {
           this._bestHash = h.hash
         }
       }
+      // Stable peer — clear its cooldown
+      this._clearCooldown(host)
       this.emit('headers', data)
     })
 
     peer.on('connected', (data) => this.emit('connected', data))
     peer.on('handshake', (data) => {
+      // Non-BSV peer was already rejected in bsv-peer.js _onVersion
+      // If we get handshake, it's a real BSV peer — clear cooldown
+      this._clearCooldown(host)
       // Ask this peer for addresses of other nodes it knows
       peer.requestAddr()
       this.emit('handshake', data)
@@ -291,7 +334,16 @@ export class BSVNodeClient extends EventEmitter {
     })
 
     peer.on('disconnected', (data) => {
+      // Check if peer was rejected for being non-BSV (no handshake completed)
+      const wasBch = !peer._handshakeComplete && peer._peerUserAgent && !peer._peerUserAgent.includes('Bitcoin SV')
       this._peers.delete(host)
+      if (wasBch) {
+        // BCH/BTC node — permanent blacklist, never reconnect
+        this._blacklist.add(host)
+      } else {
+        // Normal disconnect — exponential backoff
+        this._applyCooldown(host)
+      }
       this.emit('disconnected', data)
     })
 
@@ -306,8 +358,9 @@ export class BSVNodeClient extends EventEmitter {
     try {
       await peer.connect(host, port)
     } catch {
-      // Connection or handshake failed — remove from pool
+      // Connection or handshake failed — remove from pool, apply cooldown
       this._peers.delete(host)
+      this._applyCooldown(host)
     }
   }
 

@@ -1377,12 +1377,25 @@ export class StatusServer {
 
       const [localUtxos, gpData] = await Promise.all([localPromise, gpPromise])
 
-      // GP is authoritative — it tracks the real UTXO set.
-      // Local store only used as fallback when GP is down/empty.
+      // Merge GP + local, filtering out UTXOs spent by recent broadcasts.
+      // GP is authoritative for confirmed UTXOs but doesn't know about
+      // unconfirmed spends. Local store tracks both new outputs and spends.
       const seen = new Set()
       const merged = []
-      const source = gpData.length > 0 ? gpData : localUtxos
-      for (const u of source) {
+
+      // Start with GP data, filter out locally-spent inputs
+      for (const u of gpData) {
+        const key = `${u.txid}:${u.vout}`
+        if (seen.has(key)) continue
+        let spent = false
+        if (this._store) {
+          try { spent = await this._store.isInputSpent(u.txid, u.vout) } catch {}
+        }
+        if (!spent) { seen.add(key); merged.push({ tx_hash: u.txid, tx_pos: u.vout, value: u.satoshis }) }
+      }
+
+      // Add local unspent UTXOs that GP doesn't have (unconfirmed outputs)
+      for (const u of localUtxos) {
         const key = `${u.txid}:${u.vout}`
         if (!seen.has(key)) { seen.add(key); merged.push({ tx_hash: u.txid, tx_pos: u.vout, value: u.satoshis }) }
       }
@@ -1450,9 +1463,16 @@ export class StatusServer {
       const hash = createHash('sha256').update(createHash('sha256').update(buf).digest()).digest()
       const txid = Buffer.from(hash).reverse().toString('hex')
       const sent = this._txRelay ? this._txRelay.broadcastTx(txid, rawHex) : 0
-      // Store raw tx in PersistentStore so /api/tx/{txid}/hex can serve it later
+      // Store raw tx + mark spent inputs atomically
       if (this._store) {
-        try { await this._store.putTx(txid, rawHex) } catch {}
+        try {
+          await this._store.putTx(txid, rawHex)
+          // Mark each input as spent so /unspent filters them immediately
+          const parsed = parseTx(rawHex)
+          for (const input of parsed.inputs) {
+            await this._store.markInputSpent(input.prevTxid, input.prevVout, txid)
+          }
+        } catch {}
       }
       // Feed into AddressWatcher so local UTXO store tracks watched addresses
       if (this._addressWatcher) {

@@ -891,6 +891,7 @@ async function cmdStart () {
     peerHealth,
     bsvNodeClient: bsvNode,
     store,
+    addressWatcher: watcher,
     performOutboundHandshake,
     registeredPubkeys,
     gossipManager

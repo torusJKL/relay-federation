@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events'
-import { checkTxForWatched, pubkeyToHash160 } from './output-parser.js'
+import { checkTxForWatched, pubkeyToHash160, addressToHash160 } from './output-parser.js'
 
 /**
  * AddressWatcher — monitors transactions for outputs to watched addresses.
@@ -59,6 +59,17 @@ export class AddressWatcher extends EventEmitter {
    */
   watchHash160 (hash160, label) {
     this._watched.set(hash160, label || hash160)
+    this._hash160Set.add(hash160)
+  }
+
+  /**
+   * Watch a BSV address (auto-converts to hash160).
+   * @param {string} address — BSV address (e.g. '1KhH4V...')
+   * @param {string} [label] — optional human-readable label
+   */
+  watchAddress (address, label) {
+    const hash160 = addressToHash160(address)
+    this._watched.set(hash160, label || address)
     this._hash160Set.add(hash160)
   }
 
