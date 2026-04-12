@@ -356,7 +356,7 @@ export class BSVPeer extends EventEmitter {
   _onData (data) {
     this._buffer = Buffer.concat([this._buffer, data])
 
-    while (this._buffer.length >= MSG_HEADER_SIZE) {
+    while (this._buffer.length >= MSG_HEADER_SIZE && !this._destroyed) {
       const magicIdx = this._findMagic()
       if (magicIdx < 0) {
         this._buffer = Buffer.alloc(0)
@@ -408,6 +408,7 @@ export class BSVPeer extends EventEmitter {
   // ── Private: message handling ──────────────────────────────
 
   _handleMessage (command, payload) {
+    if (this._destroyed) return
     switch (command) {
       case 'version':
         this._onVersion(payload)
@@ -466,6 +467,7 @@ export class BSVPeer extends EventEmitter {
   }
 
   _onVerack () {
+    if (this._destroyed) return
     this._handshakeComplete = true
 
     // Send protoconf (protocol 70016+) — advertise max payload size
