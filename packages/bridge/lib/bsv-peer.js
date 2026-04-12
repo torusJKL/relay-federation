@@ -355,34 +355,52 @@ export class BSVPeer extends EventEmitter {
 
   _onData (data) {
     this._buffer = Buffer.concat([this._buffer, data])
+    if (!this._draining) this._drainBuffer()
+  }
+
+  _drainBuffer () {
+    this._draining = true
+    let processed = 0
+    const MAX_PER_TICK = 10
+    let checksumFails = 0
+    const MAX_CHECKSUM_FAILS = 20
 
     while (this._buffer.length >= MSG_HEADER_SIZE && !this._destroyed) {
       const magicIdx = this._findMagic()
       if (magicIdx < 0) {
         this._buffer = Buffer.alloc(0)
+        this._draining = false
         return
       }
       if (magicIdx > 0) {
         this._buffer = this._buffer.subarray(magicIdx)
       }
 
-      if (this._buffer.length < MSG_HEADER_SIZE) return
+      if (this._buffer.length < MSG_HEADER_SIZE) { this._draining = false; return }
 
       const command = this._buffer.subarray(4, 16).toString('ascii').replace(/\0/g, '')
       const payloadLen = this._buffer.readUInt32LE(16)
       const checksum = this._buffer.subarray(20, 24)
 
       const totalLen = MSG_HEADER_SIZE + payloadLen
-      if (this._buffer.length < totalLen) return
+      if (this._buffer.length < totalLen) { this._draining = false; return }
 
       const payload = this._buffer.subarray(MSG_HEADER_SIZE, totalLen)
 
       const computed = sha256d(payload).subarray(0, 4)
       if (!computed.equals(checksum)) {
         this._buffer = this._buffer.subarray(4)
+        checksumFails++
+        if (checksumFails >= MAX_CHECKSUM_FAILS) {
+          // Too many checksum failures — drop buffer to prevent CPU spin
+          this._buffer = Buffer.alloc(0)
+          this._draining = false
+          return
+        }
         continue
       }
 
+      checksumFails = 0
       this._buffer = this._buffer.subarray(totalLen)
 
       try {
@@ -390,7 +408,15 @@ export class BSVPeer extends EventEmitter {
       } catch (err) {
         this.emit('error', err)
       }
+
+      processed++
+      if (processed >= MAX_PER_TICK && this._buffer.length >= MSG_HEADER_SIZE) {
+        // Yield to event loop — let pongs, timers, HTTP run
+        setImmediate(() => this._drainBuffer())
+        return
+      }
     }
+    this._draining = false
   }
 
   _findMagic () {
@@ -734,12 +760,12 @@ export class BSVPeer extends EventEmitter {
    * Send protoconf (protocol 70016+) — advertise max receive payload size.
    */
   _sendProtoconf () {
-    const payload = Buffer.alloc(6)
+    const payload = Buffer.alloc(16) // oversized, will slice
     let offset = 0
-    payload.writeUInt8(2, offset); offset += 1 // numberOfFields
-    payload.writeUInt32LE(2 * 1024 * 1024, offset); offset += 4 // 2MB max
-    payload.writeUInt8(0, offset) // empty streamPolicies
-    this._sendMessage('protoconf', payload)
+    offset += writeVarInt(payload, offset, 2) // numberOfFields = 2
+    offset += writeVarInt(payload, offset, 2 * 1024 * 1024) // field1: maxRecvPayloadLength = 2MB (varint)
+    offset += writeVarInt(payload, offset, 0) // field2: streamPolicies = empty varstr (length 0)
+    this._sendMessage('protoconf', payload.subarray(0, offset))
   }
 
   _sendGetHeaders (locatorHashes) {

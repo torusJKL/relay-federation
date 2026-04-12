@@ -1474,10 +1474,9 @@ export class StatusServer {
           }
         } catch {}
       }
-      // Feed into AddressWatcher so local UTXO store tracks watched addresses
-      if (this._addressWatcher) {
-        try { await this._addressWatcher.processTxManual(rawHex) } catch {}
-      }
+      // AddressWatcher already processes this tx via txRelay 'tx:new' event
+      // (broadcastTx above emits tx:new → AddressWatcher._processTx)
+      // Removed duplicate processTxManual call that caused double UTXO events
       // Forward to ARC (fire-and-forget) so tx reaches miners
       fetch('https://arc.gorillapool.io/v1/tx', {
         method: 'POST',

@@ -656,7 +656,7 @@ async function cmdStart () {
     const timeout = setTimeout(() => {
       conn.removeListener('message', onMessage)
       if (!conn.connected) return
-      console.log(`Handshake timeout: ${conn.pubkeyHex.slice(0, 16)}...`)
+      console.log(`Handshake timeout: ${conn.pubkeyHex?.slice(0, 16) || 'unknown'}...`)
       conn.destroy()
     }, 10000)
     if (timeout.unref) timeout.unref()
@@ -828,6 +828,14 @@ async function cmdStart () {
     }
   } else if (seedPeers.length > 0) {
     // Connect to seed peers (accept both string URLs and {pubkeyHex, endpoint} objects)
+    // Validate: object-style seed peers MUST have pubkeyHex to avoid undefined key in peers map
+    for (let i = 0; i < seedPeers.length; i++) {
+      const seed = seedPeers[i]
+      if (typeof seed === 'object' && !seed.pubkeyHex) {
+        console.error(`ERROR: seedPeers[${i}] missing pubkeyHex. Get it from the peer's /status endpoint or config.json.`)
+        process.exit(1)
+      }
+    }
     console.log(`Connecting to ${seedPeers.length} seed peer(s)...`)
     for (let i = 0; i < seedPeers.length; i++) {
       if (i > 0) await new Promise(r => setTimeout(r, 2000)) // stagger to avoid handshake races

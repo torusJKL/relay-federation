@@ -290,6 +290,8 @@ export class BSVNodeClient extends EventEmitter {
     if (this._peers.has(host) || this._destroyed) return
     if (this._blacklist.has(host)) return
     if (this._isInCooldown(host)) return
+    // Cap total peers to prevent unbounded growth
+    if (this._peers.size >= 32) return
 
     const peer = new BSVPeer({
       checkpoint: this._checkpoint,
@@ -317,8 +319,7 @@ export class BSVNodeClient extends EventEmitter {
 
     peer.on('connected', (data) => this.emit('connected', data))
     peer.on('handshake', (data) => {
-      // Non-BSV peer was already rejected in bsv-peer.js _onVersion
-      // If we get handshake, it's a real BSV peer — clear cooldown
+      // Clear cooldown — handshake proves it's a real BSV peer
       this._clearCooldown(host)
       // Ask this peer for addresses of other nodes it knows
       peer.requestAddr()
@@ -326,7 +327,9 @@ export class BSVNodeClient extends EventEmitter {
     })
 
     peer.on('addr', ({ addrs }) => {
-      for (const addr of addrs) {
+      // Sample at most 8 addresses per addr message to prevent flood
+      const shuffled = addrs.sort(() => Math.random() - 0.5).slice(0, 8)
+      for (const addr of shuffled) {
         if (!this._peers.has(addr.host) && !this._destroyed) {
           this._connectToPeer(addr.host, addr.port)
         }
