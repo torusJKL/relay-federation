@@ -321,19 +321,7 @@ export class BSVNodeClient extends EventEmitter {
     peer.on('handshake', (data) => {
       // Clear cooldown — handshake proves it's a real BSV peer
       this._clearCooldown(host)
-      // Ask this peer for addresses of other nodes it knows
-      peer.requestAddr()
       this.emit('handshake', data)
-    })
-
-    peer.on('addr', ({ addrs }) => {
-      // Sample at most 8 addresses per addr message to prevent flood
-      const shuffled = addrs.sort(() => Math.random() - 0.5).slice(0, 8)
-      for (const addr of shuffled) {
-        if (!this._peers.has(addr.host) && !this._destroyed) {
-          this._connectToPeer(addr.host, addr.port)
-        }
-      }
     })
 
     peer.on('disconnected', (data) => {
