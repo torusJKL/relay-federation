@@ -319,8 +319,8 @@ export class BSVNodeClient extends EventEmitter {
 
     peer.on('connected', (data) => this.emit('connected', data))
     peer.on('handshake', (data) => {
-      // Clear cooldown — handshake proves it's a real BSV peer
-      this._clearCooldown(host)
+      // Don't clear cooldown on handshake — wait for stable connection
+      // Cooldown is cleared only after receiving headers (see 'headers' handler)
       this.emit('handshake', data)
     })
 
