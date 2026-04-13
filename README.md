@@ -64,8 +64,8 @@ npm install -g @relay-federation/bridge
 # 2. Initialize (auto-detects your IP, prompts for a name)
 relay-bridge init
 
-# 3. Fund — send BSV to the address shown by init, then import it
-relay-bridge fund <rawTxHex>
+# 3. Fund — send BSV to the address shown by init, then pick it up
+relay-bridge fund
 
 # 4. Register on-chain
 relay-bridge register
@@ -84,7 +84,7 @@ See the [Bridge Operator Handbook](BRIDGE_OPERATOR_HANDBOOK.md) for the full ste
 | `relay-bridge start` | Start the bridge server — listens for peers, syncs headers, relays transactions |
 | `relay-bridge start ws://host:port` | Start and connect to a specific peer |
 | `relay-bridge status` | Show running bridge status — peers, headers, mempool |
-| `relay-bridge fund <rawTxHex>` | Import a funding transaction (raw hex) into the bridge's UTXO store |
+| `relay-bridge fund` | Auto-detect funds sent to your bridge address and import them |
 | `relay-bridge register` | Register on-chain — builds stake bond tx + registration tx, broadcasts to BSV network |
 | `relay-bridge deregister [reason]` | Deregister this bridge from the mesh |
 | `relay-bridge backfill` | Backfill historical inscriptions and tokens for watched addresses |
@@ -128,11 +128,10 @@ Registration puts your bridge on-chain so other bridges can discover and peer wi
 
 ```bash
 # 1. Send BSV to your bridge address (shown during init)
-# 2. Get the raw tx hex from your wallet or block explorer
-# 3. Import it
-relay-bridge fund <rawTxHex>
+# 2. Import it (auto-detects funds at your address)
+relay-bridge fund
 
-# 4. Register (bridge must be stopped — can't share LevelDB lock)
+# 3. Register (bridge must be stopped — can't share LevelDB lock)
 relay-bridge register
 # Output:
 #   Stake bond txid: abc123...

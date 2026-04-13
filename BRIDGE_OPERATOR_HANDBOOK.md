@@ -66,18 +66,19 @@ Send BSV to the address shown in Step 3. You need at least 0.01 BSV (1,000,000 s
 
 You can send from any wallet or exchange — HandCash, Centbee, RelayX, or wherever you hold BSV.
 
-After sending, wait for the transaction to confirm (usually a few seconds on BSV), then import it:
+After sending, wait for the transaction to confirm (usually a few seconds on BSV), then tell the bridge to pick it up:
 
 ```bash
-relay-bridge fund <rawTxHex>
+relay-bridge fund
 ```
 
-To get the raw transaction hex, look up the transaction on a block explorer like [whatsonchain.com](https://whatsonchain.com), find your transaction, and copy the raw hex.
+The bridge checks its own address automatically — no need to copy anything from a block explorer.
 
 You should see output like:
 
 ```
-Found 1 output(s) for this bridge
+Checking 1PVrv...WNDE for funds...
+Found 1 output(s). Importing...
   UTXO stored: abc123....:0 (1500000 sat)
   Total balance: 1500000 satoshis
 ```
@@ -220,7 +221,7 @@ The full setup is five commands:
 
 ```bash
 relay-bridge init
-relay-bridge fund <rawTxHex>
+relay-bridge fund
 relay-bridge register
 relay-bridge start
 ```

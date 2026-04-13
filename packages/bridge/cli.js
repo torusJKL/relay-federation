@@ -1206,13 +1206,6 @@ async function cmdStatus () {
 
 async function cmdFund () {
   const rawHex = process.argv[3]
-  if (!rawHex) {
-    console.log('Usage: relay-bridge fund <rawTxHex>')
-    console.log('')
-    console.log('  Provide the raw hex of a transaction that pays to this bridge.')
-    console.log('  Get the raw hex from your wallet or a block explorer after sending BSV.')
-    process.exit(1)
-  }
 
   const dir = defaultConfigDir()
 
@@ -1230,12 +1223,71 @@ async function cmdFund () {
   await store.open()
 
   try {
-    await runFund({
-      config,
-      store,
-      rawHex,
-      log: (type, msg) => console.log(`  ${msg}`)
-    })
+    if (rawHex) {
+      // Manual mode: raw hex provided as argument
+      await runFund({
+        config,
+        store,
+        rawHex,
+        log: (type, msg) => console.log(`  ${msg}`)
+      })
+    } else {
+      // Auto-detect: scan bridge address for incoming UTXOs
+      const addr = config.address
+      if (!addr) {
+        console.log('No address in config. Re-run: relay-bridge init')
+        process.exit(1)
+      }
+
+      console.log(`Checking ${addr} for funds...`)
+
+      // Query GorillaPool for unspent outputs
+      let utxos = []
+      try {
+        const resp = await fetch(
+          `https://ordinals.gorillapool.io/api/txos/address/${addr}/unspent`,
+          { signal: AbortSignal.timeout(15000) }
+        )
+        if (resp.ok) {
+          const data = await resp.json()
+          if (Array.isArray(data)) utxos = data
+        }
+      } catch {}
+
+      if (utxos.length === 0) {
+        console.log('No funds found yet.')
+        console.log(`  Send BSV to: ${addr}`)
+        console.log('  Then run this command again.')
+        process.exit(0)
+      }
+
+      console.log(`Found ${utxos.length} output(s). Importing...`)
+
+      // Deduplicate by txid
+      const txids = [...new Set(utxos.map(u => u.txid).filter(Boolean))]
+      let imported = 0
+
+      for (const txid of txids) {
+        const hex = await fetchRawTx(txid)
+        if (!hex) {
+          console.log(`  Skipped ${txid.slice(0, 12)}... (could not fetch)`)
+          continue
+        }
+        try {
+          await runFund({
+            config,
+            store,
+            rawHex: hex,
+            log: (type, msg) => console.log(`  ${msg}`)
+          })
+          imported++
+        } catch (err) {
+          console.log(`  Skipped ${txid.slice(0, 12)}...: ${err.message}`)
+        }
+      }
+
+      console.log(`\nDone. Imported ${imported} transaction(s).`)
+    }
   } catch (err) {
     console.log(`Fund failed: ${err.message}`)
     process.exit(1)
