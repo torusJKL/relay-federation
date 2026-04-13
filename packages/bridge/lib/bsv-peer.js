@@ -761,7 +761,7 @@ export class BSVPeer extends EventEmitter {
   // ── Private: message building ──────────────────────────────
 
   _sendMessage (command, payload) {
-    if (!this._socket || !this._connected) return
+    if (!this._socket || !this._connected || this._socket.destroyed) return
 
     const header = Buffer.alloc(MSG_HEADER_SIZE)
     MAGIC.copy(header, 0)

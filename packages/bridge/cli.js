@@ -1128,6 +1128,13 @@ async function cmdStart () {
 
   process.on('SIGINT', shutdown)
   process.on('SIGTERM', shutdown)
+
+  process.on('uncaughtException', (err) => {
+    console.log(`Uncaught exception: ${err.message}`)
+  })
+  process.on('unhandledRejection', (err) => {
+    console.log(`Unhandled rejection: ${err && err.message ? err.message : err}`)
+  })
 }
 
 async function cmdStatus () {
