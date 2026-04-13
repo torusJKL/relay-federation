@@ -20,90 +20,130 @@ const command = process.argv[2]
  * @param {Set<string>} registeredPubkeys - Set to populate with registered pubkeys
  * @param {string} selfPubkey - Our own pubkey (skip self-registration)
  */
+/**
+ * Fetch beacon address history from multiple providers.
+ * Tries GorillaPool first, falls back to WoC.
+ * @param {string} beaconAddress
+ * @returns {Promise<string[]>} Array of txids
+ */
+async function fetchBeaconHistory (beaconAddress) {
+  // Provider 1: GorillaPool ordinals — unspent outputs at beacon address
+  // Beacon outputs are unspendable (no private key), so unspent = full history
+  try {
+    const gpResp = await fetch(
+      `https://ordinals.gorillapool.io/api/txos/address/${beaconAddress}/unspent`,
+      { signal: AbortSignal.timeout(15000) }
+    )
+    if (gpResp.ok) {
+      const gpData = await gpResp.json()
+      if (Array.isArray(gpData) && gpData.length > 0) {
+        console.log(`  Beacon backfill: GorillaPool returned ${gpData.length} UTXOs`)
+        return gpData.map(u => u.txid).filter(Boolean)
+      }
+    }
+  } catch {}
+
+  // Provider 2: WoC — confirmed history (last resort)
+  try {
+    const wocResp = await fetch(
+      `https://api.whatsonchain.com/v1/bsv/main/address/${beaconAddress}/confirmed/history`,
+      { signal: AbortSignal.timeout(30000) }
+    )
+    if (wocResp.ok) {
+      const data = await wocResp.json()
+      const history = Array.isArray(data) ? data : (data.result || [])
+      if (history.length > 0) {
+        console.log(`  Beacon backfill: WoC returned ${history.length} transactions`)
+        return history.sort((a, b) => (a.height || 0) - (b.height || 0)).map(h => h.tx_hash).filter(Boolean)
+      }
+    }
+  } catch {}
+
+  return []
+}
+
+/**
+ * Fetch raw tx hex from available providers.
+ * @param {string} txid
+ * @returns {Promise<string|null>}
+ */
+async function fetchRawTx (txid) {
+  // WoC — returns clean hex string
+  try {
+    const resp = await fetch(
+      `https://api.whatsonchain.com/v1/bsv/main/tx/${txid}/hex`,
+      { signal: AbortSignal.timeout(10000) }
+    )
+    if (resp.ok) return await resp.text()
+  } catch {}
+
+  return null
+}
+
+/**
+ * Scan historical beacon registrations on startup.
+ * Fetches beacon address history from GorillaPool/WoC and parses each tx
+ * to populate the registeredPubkeys Set with all valid registrations.
+ * Returns discovered peers with endpoints for zero-config mesh bootstrap.
+ *
+ * @param {Set<string>} registeredPubkeys - Set to populate with registered pubkeys
+ * @param {string} selfPubkey - Our own pubkey (skip self-registration)
+ * @returns {Promise<Array<{pubkeyHex: string, endpoint: string}>>} Discovered peers
+ */
 async function backfillBeaconRegistry (registeredPubkeys, selfPubkey) {
   const { BEACON_ADDRESS, PROTOCOL_PREFIX } = await import('@relay-federation/common/protocol')
   const { extractOpReturnData, decodePayload } = await import('@relay-federation/registry/lib/cbor.js')
   const { Transaction } = await import('@bsv/sdk')
 
   console.log(`  Beacon backfill: scanning ${BEACON_ADDRESS}...`)
+  const discoveredPeers = []
 
   try {
-    // Fetch confirmed history (registrations should be confirmed)
-    const historyResp = await fetch(
-      `https://api.whatsonchain.com/v1/bsv/main/address/${BEACON_ADDRESS}/confirmed/history`,
-      { signal: AbortSignal.timeout(30000) }
-    )
-    if (!historyResp.ok) {
-      console.log(`  Beacon backfill: WoC returned ${historyResp.status}, skipping`)
-      return
-    }
-
-    const data = await historyResp.json()
-    const history = Array.isArray(data) ? data : (data.result || [])
-    if (history.length === 0) {
+    const txids = await fetchBeaconHistory(BEACON_ADDRESS)
+    if (txids.length === 0) {
       console.log(`  Beacon backfill: no history found`)
-      return
+      return discoveredPeers
     }
 
-    console.log(`  Beacon backfill: found ${history.length} transactions`)
-
-    // Track registrations and deregistrations to handle order correctly
-    // Process oldest first (history is typically newest-first from WoC)
-    const sortedHistory = [...history].sort((a, b) => (a.height || 0) - (b.height || 0))
-
+    // Track registrations and deregistrations
+    // Also track endpoints: pubkey → endpoint (latest wins)
+    const peerEndpoints = new Map()
     let registered = 0
     let deregistered = 0
     let skipped = 0
 
-    for (const item of sortedHistory) {
-      const txid = item.tx_hash
-      if (!txid) continue
-
+    for (const txid of txids) {
       try {
-        // Rate limit to avoid WoC throttling
+        // Rate limit to avoid throttling
         await new Promise(r => setTimeout(r, 100))
 
-        const txResp = await fetch(
-          `https://api.whatsonchain.com/v1/bsv/main/tx/${txid}/hex`,
-          { signal: AbortSignal.timeout(10000) }
-        )
-        if (!txResp.ok) {
-          skipped++
-          continue
-        }
+        const rawHex = await fetchRawTx(txid)
+        if (!rawHex) { skipped++; continue }
 
-        const rawHex = await txResp.text()
         const tx = Transaction.fromHex(rawHex)
 
         // Find OP_RETURN output
         const opReturnOutput = tx.outputs.find(out =>
           out.satoshis === 0 && out.lockingScript.toHex().startsWith('006a')
         )
-        if (!opReturnOutput) {
-          skipped++
-          continue
-        }
+        if (!opReturnOutput) { skipped++; continue }
 
         const { prefix, cborBytes } = extractOpReturnData(opReturnOutput.lockingScript)
-        if (prefix !== PROTOCOL_PREFIX) {
-          skipped++
-          continue
-        }
+        if (prefix !== PROTOCOL_PREFIX) { skipped++; continue }
 
         const entry = decodePayload(cborBytes)
-        if (!entry || !entry.pubkey) {
-          skipped++
-          continue
-        }
+        if (!entry || !entry.pubkey) { skipped++; continue }
 
         const pubHex = Buffer.from(entry.pubkey).toString('hex')
         if (pubHex === selfPubkey) continue // skip self
 
         if (entry.action === 'register') {
           registeredPubkeys.add(pubHex)
+          if (entry.endpoint) peerEndpoints.set(pubHex, entry.endpoint)
           registered++
         } else if (entry.action === 'deregister') {
           registeredPubkeys.delete(pubHex)
+          peerEndpoints.delete(pubHex)
           deregistered++
         }
       } catch {
@@ -111,11 +151,23 @@ async function backfillBeaconRegistry (registeredPubkeys, selfPubkey) {
       }
     }
 
+    // Build discovered peers list from active registrations
+    for (const [pubkeyHex, endpoint] of peerEndpoints) {
+      if (registeredPubkeys.has(pubkeyHex)) {
+        discoveredPeers.push({ pubkeyHex, endpoint })
+      }
+    }
+
     console.log(`  Beacon backfill: +${registered} registered, -${deregistered} deregistered, ${skipped} skipped`)
     console.log(`  Registry: ${registeredPubkeys.size} trusted pubkeys after backfill`)
+    if (discoveredPeers.length > 0) {
+      console.log(`  Discovered ${discoveredPeers.length} peer endpoint(s) from on-chain registry`)
+    }
   } catch (err) {
     console.log(`  Beacon backfill failed: ${err.message}`)
   }
+
+  return discoveredPeers
 }
 
 switch (command) {
@@ -159,6 +211,18 @@ switch (command) {
     process.exit(command ? 1 : 0)
 }
 
+async function prompt (question, defaultValue) {
+  const { createInterface } = await import('node:readline')
+  const rl = createInterface({ input: process.stdin, output: process.stdout })
+  return new Promise(resolve => {
+    const suffix = defaultValue ? ` (${defaultValue})` : ''
+    rl.question(`${question}${suffix}: `, answer => {
+      rl.close()
+      resolve(answer.trim() || defaultValue || '')
+    })
+  })
+}
+
 async function cmdInit () {
   const dir = defaultConfigDir()
 
@@ -168,7 +232,17 @@ async function cmdInit () {
     process.exit(1)
   }
 
-  const config = await initConfig(dir)
+  // Auto-detect IP for default name
+  let publicIp = null
+  try {
+    const res = await fetch('https://api.ipify.org?format=json', { signal: AbortSignal.timeout(5000) })
+    if (res.ok) publicIp = (await res.json()).ip
+  } catch {}
+  const defaultName = publicIp ? 'bridge-' + publicIp.split('.').pop() : 'my-bridge'
+
+  const name = await prompt('Bridge name', defaultName)
+
+  const config = await initConfig(dir, { name })
 
   console.log('Bridge initialized!\n')
   console.log(`  Name:     ${config.name}`)
@@ -181,9 +255,13 @@ async function cmdInit () {
   console.log('  Save your operator secret! You need it to log into the dashboard.')
   console.log('')
   console.log('Next steps:')
-  console.log(`  1. Fund your bridge: send BSV to ${config.address}`)
-  console.log('  2. Import the funding tx: relay-bridge fund <rawTxHex>')
-  console.log('  3. Run: relay-bridge register')
+  console.log(`  1. Fund your bridge:  send BSV to ${config.address}`)
+  console.log('  2. Import funding tx: relay-bridge fund <rawTxHex>')
+  console.log('  3. Register on-chain: relay-bridge register')
+  console.log('  4. Start your bridge: relay-bridge start')
+  console.log('')
+  console.log('  Your bridge will discover the mesh automatically from the blockchain.')
+  console.log(`  Dashboard: http://<your-ip>:${config.statusPort || 9333}`)
 }
 
 async function cmdSecret () {
@@ -543,7 +621,7 @@ async function cmdStart () {
   console.log(`  Registry: ${registeredPubkeys.size} trusted pubkeys (self + seeds)`)
 
   // ── 4a-2. Beacon backfill — scan historical registrations on startup ──
-  await backfillBeaconRegistry(registeredPubkeys, config.pubkeyHex)
+  const discoveredPeers = await backfillBeaconRegistry(registeredPubkeys, config.pubkeyHex)
 
   // ── 4b. Beacon address watcher — detect on-chain registrations ──
   const { extractOpReturnData, decodePayload, PROTOCOL_PREFIX } = await import('@relay-federation/registry/lib/cbor.js')
@@ -880,10 +958,20 @@ async function cmdStart () {
       console.log(`Peer scan failed: ${err.message}`)
       console.log('Start with manual peer: relay-bridge start ws://peer:port')
     }
+  } else if (discoveredPeers.length > 0) {
+    // Zero-config: connect to peers discovered from on-chain beacon registry
+    console.log(`Connecting to ${discoveredPeers.length} peer(s) discovered from on-chain registry...`)
+    for (let i = 0; i < discoveredPeers.length; i++) {
+      if (i > 0) await new Promise(r => setTimeout(r, 2000)) // stagger to avoid handshake races
+      const { pubkeyHex, endpoint } = discoveredPeers[i]
+      const conn = peerManager.connectToPeer({ pubkeyHex, endpoint })
+      if (conn) {
+        conn.on('open', () => performOutboundHandshake(conn))
+      }
+    }
   } else {
-    console.log('No seed peers, no manual peer, and no API key configured.')
-    console.log('Usage: relay-bridge start ws://peer:port')
-    console.log('   or: Add seedPeers to config.json')
+    console.log('No peers found. Register your bridge first: relay-bridge register')
+    console.log('  Or connect manually: relay-bridge start ws://peer:port')
   }
 
   // ── 8. Status server ──────────────────────────────────────

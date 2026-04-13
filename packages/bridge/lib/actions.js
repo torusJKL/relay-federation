@@ -53,15 +53,25 @@ export async function runRegister ({ config, store, log }) {
   log('step', 'Connecting to BSV network...')
   const bsvNode = new BSVNodeClient()
 
+  let chainTipHeight = 0
   await new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       bsvNode.disconnect()
       reject(new Error('BSV node connection timeout (15s)'))
     }, 15000)
-    bsvNode.on('handshake', () => { clearTimeout(timeout); resolve() })
+    bsvNode.on('handshake', ({ startHeight }) => {
+      clearTimeout(timeout)
+      chainTipHeight = startHeight
+      resolve()
+    })
     bsvNode.on('error', (err) => { clearTimeout(timeout); reject(err) })
     bsvNode.connect()
   })
+
+  // Wait for header sync — BSV nodes ignore inv from unsynced peers
+  log('step', `Syncing headers to ${chainTipHeight}...`)
+  await bsvNode.waitForSync(chainTipHeight, 60000)
+  log('step', `Headers synced to ${bsvNode.bestHeight}`)
 
   try {
     // Step 1: Build and broadcast stake bond tx
@@ -71,11 +81,10 @@ export async function runRegister ({ config, store, log }) {
     log('step', `Building stake bond (${MIN_STAKE_SATS} sats)...`)
     const stakeBond = await buildStakeBondTx({ wif: config.wif, utxos })
 
-    bsvNode.broadcastTx(stakeBond.txHex)
     log('step', `Stake bond txid: ${stakeBond.txid}`)
-
-    // Brief wait for stake tx to propagate
-    await new Promise(r => setTimeout(r, 1000))
+    bsvNode.pushTx(stakeBond.txHex)
+    log('step', 'Stake bond pushed to BSV network')
+    await new Promise(r => setTimeout(r, 2000))
 
     // Step 2: Build registration tx using real stake bond txid
     const stakeTxid = new Uint8Array(Buffer.from(stakeBond.txid, 'hex'))
@@ -109,11 +118,9 @@ export async function runRegister ({ config, store, log }) {
       meshId: config.meshId
     })
 
-    bsvNode.broadcastTx(txHex)
-    log('done', `Registration broadcast successful! txid: ${txid}`, { stakeTxid: stakeBond.txid, registrationTxid: txid })
-
-    // Brief wait for tx to propagate
-    await new Promise(r => setTimeout(r, 1000))
+    bsvNode.pushTx(txHex)
+    log('done', `Registration broadcast! txid: ${txid}`, { stakeTxid: stakeBond.txid, registrationTxid: txid })
+    await new Promise(r => setTimeout(r, 2000))
 
     return { stakeTxid: stakeBond.txid, registrationTxid: txid }
   } finally {
@@ -172,21 +179,29 @@ export async function runDeregister ({ config, store, reason = 'shutdown', log }
   log('step', 'Connecting to BSV network...')
   const bsvNode = new BSVNodeClient()
 
+  let chainTipHeight = 0
   await new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       bsvNode.disconnect()
       reject(new Error('BSV node connection timeout (15s)'))
     }, 15000)
-    bsvNode.on('handshake', () => { clearTimeout(timeout); resolve() })
+    bsvNode.on('handshake', ({ startHeight }) => {
+      clearTimeout(timeout)
+      chainTipHeight = startHeight
+      resolve()
+    })
     bsvNode.on('error', (err) => { clearTimeout(timeout); reject(err) })
     bsvNode.connect()
   })
 
-  try {
-    bsvNode.broadcastTx(txHex)
-    log('done', `Deregistration broadcast successful! txid: ${txid}`, { txid })
+  log('step', `Syncing headers to ${chainTipHeight}...`)
+  await bsvNode.waitForSync(chainTipHeight, 60000)
+  log('step', `Headers synced to ${bsvNode.bestHeight}`)
 
-    await new Promise(r => setTimeout(r, 1000))
+  try {
+    bsvNode.pushTx(txHex)
+    log('done', `Deregistration broadcast! txid: ${txid}`, { txid })
+    await new Promise(r => setTimeout(r, 2000))
     return { txid }
   } finally {
     bsvNode.disconnect()
@@ -324,19 +339,29 @@ export async function runSend ({ config, store, toAddress, amount, log }) {
   const { BSVNodeClient } = await import('./bsv-node-client.js')
   const bsvNode = new BSVNodeClient()
 
+  let chainTipHeight = 0
   await new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       bsvNode.disconnect()
       reject(new Error('BSV node connection timeout (15s)'))
     }, 15000)
-    bsvNode.on('handshake', () => { clearTimeout(timeout); resolve() })
+    bsvNode.on('handshake', ({ startHeight }) => {
+      clearTimeout(timeout)
+      chainTipHeight = startHeight
+      resolve()
+    })
     bsvNode.on('error', (err) => { clearTimeout(timeout); reject(err) })
     bsvNode.connect()
   })
 
+  log('step', `Syncing headers to ${chainTipHeight}...`)
+  await bsvNode.waitForSync(chainTipHeight, 60000)
+  log('step', `Headers synced to ${bsvNode.bestHeight}`)
+
   try {
-    bsvNode.broadcastTx(txHex)
-    log('step', `Broadcast txid: ${txid}`)
+    bsvNode.pushTx(txHex)
+    log('step', `Broadcast pushed: ${txid}`)
+    await new Promise(r => setTimeout(r, 2000))
 
     // Mark spent UTXOs in store
     for (const utxo of utxos) {
@@ -362,7 +387,6 @@ export async function runSend ({ config, store, toAddress, amount, log }) {
       }
     }
 
-    await new Promise(r => setTimeout(r, 1000))
     const balance = await store.getBalance()
     log('done', `Sent ${amount} sats to ${toAddress}. Remaining balance: ${balance} sats`, { txid, sent: amount, balance })
 

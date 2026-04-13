@@ -168,6 +168,7 @@ export class StatusServer {
         version: PKG_VERSION,
         pubkeyHex: this._config.pubkeyHex || null,
         meshId: this._config.meshId || null,
+        endpoint: this._config.endpoint || null,
         uptimeSeconds: Math.floor((Date.now() - this._startedAt) / 1000)
       },
       peers: {
@@ -206,7 +207,6 @@ export class StatusServer {
     // Operator-only fields
     if (authenticated) {
       status.operator = true
-      status.bridge.endpoint = this._config.endpoint || null
       status.bridge.domains = this._config.domains || []
       try {
         const { PrivateKey } = await import('@bsv/sdk')

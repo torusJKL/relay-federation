@@ -330,6 +330,40 @@ export class BSVPeer extends EventEmitter {
     return txid
   }
 
+  /**
+   * Push a raw transaction directly (no inv/getdata dance).
+   * More reliable for one-shot broadcasts from short-lived connections.
+   *
+   * @param {string} rawTxHex
+   * @returns {string} txid (display format)
+   */
+  pushTx (rawTxHex) {
+    const txBuffer = Buffer.from(rawTxHex, 'hex')
+    const txid = internalToHash(sha256d(txBuffer))
+    this._sendMessage('tx', txBuffer)
+    return txid
+  }
+
+  /**
+   * Request full tx data for multiple txids via batch getdata.
+   * Responses arrive as 'tx' events from _onTx handler.
+   * @param {string[]} txids — display-format txids
+   */
+  requestTxs (txids) {
+    if (!this._handshakeComplete || txids.length === 0) return
+    const count = txids.length
+    const payloadSize = 9 + count * 36 // varint + (type + hash) per entry
+    const payload = Buffer.alloc(payloadSize)
+    const viSize = writeVarInt(payload, 0, count)
+    let offset = viSize
+    for (const txid of txids) {
+      payload.writeUInt32LE(1, offset) // MSG_TX = 1
+      hashToInternal(txid).copy(payload, offset + 4)
+      offset += 36
+    }
+    this._sendMessage('getdata', payload.subarray(0, offset))
+  }
+
   /** Current best height */
   get bestHeight () { return this._bestHeight }
   /** Current best hash */
@@ -622,6 +656,10 @@ export class BSVPeer extends EventEmitter {
 
     if (txids.length > 0) {
       this.emit('tx:inv', { txids, peer: this })
+      // Request full tx data per whitepaper Section 5.4:
+      // "When a full node announces transactions via inv,
+      //  the SPV client responds with getdata to request the full data."
+      this.requestTxs(txids)
     }
   }
 
@@ -713,6 +751,8 @@ export class BSVPeer extends EventEmitter {
         const rawHex = this._pendingBroadcasts.get(txid)
         if (rawHex) {
           this._sendMessage('tx', Buffer.from(rawHex, 'hex'))
+          this._pendingBroadcasts.delete(txid)
+          this.emit('tx:broadcast', txid)
         }
       }
     }

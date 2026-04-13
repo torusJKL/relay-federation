@@ -6,7 +6,7 @@ import { BSVPeer } from './bsv-peer.js'
  * BSVNodeClient — multi-peer pool manager for BSV P2P connections.
  *
  * Manages a pool of BSVPeer connections for redundancy:
- * - DNS-only peer discovery (3 seeds, no WoC dependency)
+ * - DNS seed + P2P addr exchange peer discovery (no WoC dependency)
  * - Connects to multiple BSV nodes simultaneously
  * - Broadcasts transactions to ALL connected peers
  * - Fetches transactions from first available peer
@@ -68,6 +68,9 @@ export class BSVNodeClient extends EventEmitter {
     this._maxCooldownMs = 300000      // 5 min cap
     // Permanent blacklist for non-BSV peers (BCH/BTC) — never reconnect
     this._blacklist = new Set()
+
+    // Peers discovered via P2P addr exchange (not just DNS)
+    this._addrPool = new Set()
 
     // Track best height across all peers
     this._bestHeight = this._checkpoint.height
@@ -135,6 +138,92 @@ export class BSVNodeClient extends EventEmitter {
       }
     }
     return txid
+  }
+
+  /**
+   * Push a raw transaction directly to ALL connected peers (no inv/getdata).
+   * @param {string} rawTxHex
+   * @returns {string} txid
+   */
+  pushTx (rawTxHex) {
+    let txid = null
+    for (const peer of this._peers.values()) {
+      if (peer._handshakeComplete) {
+        txid = peer.pushTx(rawTxHex)
+      }
+    }
+    return txid
+  }
+
+  /**
+   * Broadcast a raw tx and wait for at least one BSV node to request it via getdata.
+   * Returns when the tx is actually delivered, not just announced.
+   *
+   * @param {string} rawTxHex
+   * @param {number} [timeoutMs=10000]
+   * @returns {Promise<string>} txid
+   */
+  broadcastTxAndWait (rawTxHex, timeoutMs = 10000) {
+    const txid = this.broadcastTx(rawTxHex)
+    if (!txid) return Promise.reject(new Error('No connected BSV peers for broadcast'))
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        cleanup()
+        reject(new Error(`Broadcast timeout: no peer requested tx ${txid.slice(0, 16)}... within ${timeoutMs}ms`))
+      }, timeoutMs)
+
+      const onBroadcast = (broadcastTxid) => {
+        if (broadcastTxid === txid) {
+          cleanup()
+          resolve(txid)
+        }
+      }
+
+      const cleanup = () => {
+        clearTimeout(timer)
+        for (const peer of this._peers.values()) {
+          peer.removeListener('tx:broadcast', onBroadcast)
+        }
+      }
+
+      for (const peer of this._peers.values()) {
+        peer.on('tx:broadcast', onBroadcast)
+      }
+    })
+  }
+
+  /**
+   * Wait for header sync to reach the chain tip (reported by peers at handshake).
+   * BSV nodes ignore inv from peers that appear unsynced.
+   *
+   * @param {number} targetHeight — Chain tip height from peer handshake
+   * @param {number} [timeoutMs=30000]
+   * @returns {Promise<number>} — Synced height
+   */
+  waitForSync (targetHeight, timeoutMs = 30000) {
+    if (this._bestHeight >= targetHeight) return Promise.resolve(this._bestHeight)
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        cleanup()
+        reject(new Error(`Header sync timeout: at ${this._bestHeight}, need ${targetHeight}`))
+      }, timeoutMs)
+
+      const onHeaders = () => {
+        if (this._bestHeight >= targetHeight) {
+          cleanup()
+          resolve(this._bestHeight)
+        }
+      }
+
+      const cleanup = () => {
+        clearTimeout(timer)
+        this.removeListener('headers', onHeaders)
+      }
+
+      this.on('headers', onHeaders)
+    })
   }
 
   /**
@@ -322,6 +411,18 @@ export class BSVNodeClient extends EventEmitter {
       // Don't clear cooldown on handshake — wait for stable connection
       // Cooldown is cleared only after receiving headers (see 'headers' handler)
       this.emit('handshake', data)
+      // Ask this peer for its known peers
+      peer.requestAddr()
+    })
+
+    // Discover new peers through P2P addr exchange
+    peer.on('addr', ({ addrs }) => {
+      for (const a of addrs) {
+        if (!this._peers.has(a.host) && !this._blacklist.has(a.host)) {
+          this._addrPool.add(`${a.host}:${a.port}`)
+          this._connectToPeer(a.host, a.port)
+        }
+      }
     })
 
     peer.on('disconnected', (data) => {
@@ -368,7 +469,7 @@ export class BSVNodeClient extends EventEmitter {
       }
     }
 
-    // Reconnect to any new peers discovered
+    // Reconnect to any new peers discovered via DNS
     try {
       const addresses = await this._discoverPeers()
       const newAddrs = addresses.filter(a => !this._peers.has(a.host))
@@ -377,6 +478,21 @@ export class BSVNodeClient extends EventEmitter {
       }
     } catch {
       // DNS failed during maintenance — try again next cycle
+    }
+
+    // Try peers from addr pool that aren't currently connected
+    for (const entry of this._addrPool) {
+      const [host, portStr] = entry.split(':')
+      if (!this._peers.has(host)) {
+        this._connectToPeer(host, parseInt(portStr, 10))
+      }
+    }
+
+    // Ask existing peers for more addrs periodically
+    for (const peer of this._peers.values()) {
+      if (peer._handshakeComplete) {
+        peer.requestAddr()
+      }
     }
   }
 }
