@@ -1269,7 +1269,7 @@ function renderCardExpanded(type, b, op) {
         html += '<div><span class="peer-dot green"></span><span class="peer-name" style="cursor:pointer" onclick="event.stopPropagation();copyText(\'' + (p.pubkeyHex || '') + '\', this)">' + truncPubkey(p.pubkeyHex) + '</span></div>';
         html += '<span style="font-family:var(--mono);font-size:13px;font-weight:600;color:' + scoreClr + '">' + scoreVal + '</span>';
         html += '</div>';
-        html += '<div style="font-size:11px;color:var(--text-dim);margin-top:2px">' + (p.endpoint || 'no endpoint') + (p.health ? ' &middot; ' + p.health : '') + '</div>';
+        html += '<div style="font-size:11px;color:var(--text-dim);margin-top:2px">' + (p.health || '') + '</div>';
         if (p.scoreBreakdown) {
           html += '<div style="margin-top:6px">' + renderScoreBars(p.scoreBreakdown) + '</div>';
         }
@@ -1375,6 +1375,19 @@ function tryDecodeAscii(hex) {
 
 // ── Fetch ──────────────────────────────────────────
 async function fetchBridge(bridge) {
+  // Guard: can't poll bridges without statusUrl
+  if (!bridge.url) {
+    return {
+      _name: bridge.name || 'Unknown',
+      _url: null,
+      _noPoll: true,
+      bridge: { pubkeyHex: bridge.pubkeyHex || null, endpoint: null, meshId: null, uptimeSeconds: 0 },
+      peers: { connected: 0, list: [] },
+      headers: { bestHeight: -1, bestHash: null, count: 0 },
+      txs: { mempool: 0, seen: 0 },
+      system: null
+    };
+  }
   try {
     const r = await fetch(bridge.url + '/status' + getAuthParam(bridge.url), { signal: AbortSignal.timeout(5000) });
     if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -1398,6 +1411,7 @@ async function fetchBridge(bridge) {
   }
 }
 async function fetchMempool(bridge) {
+  if (!bridge.url) return { count: 0, txs: [] };
   try {
     const r = await fetch(bridge.url + '/mempool', { signal: AbortSignal.timeout(5000) });
     if (!r.ok) return { count: 0, txs: [] };
@@ -1407,24 +1421,31 @@ async function fetchMempool(bridge) {
 async function discoverBridges() {
   const known = new Map();
   // Seed URLs start with no name — /status will fill them in
-  for (const url of SEED_URLS) known.set(url, null);
+  for (const url of SEED_URLS) known.set(url, { name: null, statusUrl: url, pubkeyHex: null });
   for (const url of SEED_URLS) {
     try {
       const r = await fetch(url + '/discover', { signal: AbortSignal.timeout(5000) });
       if (!r.ok) continue;
       const data = await r.json();
       if (!data.bridges) continue;
-      for (const b of data.bridges) {
-        if (!b.statusUrl) continue;
-        const base = b.statusUrl.replace(/\/status$/, '');
-        if (!known.has(base)) {
-          // Use name from /discover if available, otherwise placeholder until /status fills it in
-          known.set(base, b.name || null);
-        }
+      for (const br of data.bridges) {
+        // Use statusUrl if available, otherwise pubkeyHex as key
+        const key = br.statusUrl ? br.statusUrl.replace(/\/status$/, '') : `pubkey:${br.pubkeyHex}`;
+        // Always update - merge with existing data
+        const existing = known.get(key) || {};
+        known.set(key, {
+          name: br.name || existing.name || (br.pubkeyHex ? br.pubkeyHex.slice(0, 8) + '...' : 'Unknown'),
+          statusUrl: br.statusUrl ? br.statusUrl.replace(/\/status$/, '') : existing.statusUrl || null,
+          pubkeyHex: br.pubkeyHex || existing.pubkeyHex || null
+        });
       }
     } catch {}
   }
-  BRIDGES = [...known.entries()].map(([url, name]) => ({ name, url }));
+  BRIDGES = [...known.entries()].map(([key, data]) => ({
+    name: data.name,
+    url: data.statusUrl,
+    pubkeyHex: data.pubkeyHex
+  }));
   discoveryDone = true;
 }
 
@@ -1485,9 +1506,7 @@ function renderBridgeRail() {
     const sel = selectedBridge === name ? ' selected' : '';
     html += '<div class="rail-item' + sel + '" onclick="selectBridge(\'' + name + '\')">';
     html += '<span class="status-dot ' + dotColor + '"></span>';
-    html += '<div style="display:flex;flex-direction:column;flex:1;min-width:0"><span class="rail-name">' + name + '</span>';
-    const ip = (b._url || '').replace(/^https?:\/\//, '').replace(/:\d+$/, '');
-    html += '<span style="font-size:10px;color:var(--text-muted);opacity:0.6">' + ip + '</span></div>';
+    html += '<div style="display:flex;flex-direction:column;flex:1;min-width:0"><span class="rail-name">' + name + '</span></div>';
     html += '<div style="text-align:right"><span class="rail-height">' + fmtHeight(b.headers.bestHeight) + '</span>';
     if (b.bridge && b.bridge.version) html += '<div style="font-size:9px;color:var(--text-dim)">v' + b.bridge.version + '</div>';
     html += '</div>';

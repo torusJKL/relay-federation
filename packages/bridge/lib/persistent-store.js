@@ -2,7 +2,7 @@ import { Level } from 'level'
 import { EventEmitter } from 'node:events'
 import { createHash } from 'node:crypto'
 import { join } from 'node:path'
-import { mkdir, writeFile, readFile } from 'node:fs/promises'
+import { mkdir, writeFile, readFile, rename } from 'node:fs/promises'
 
 /**
  * PersistentStore — LevelDB-backed storage for bridge state.
@@ -50,25 +50,57 @@ export class PersistentStore extends EventEmitter {
 
   /** Open the database and create sublevels. */
   async open () {
-    this.db = new Level(this.dbPath, { valueEncoding: 'json' })
-    await this.db.open()
-    this._headers = this.db.sublevel('headers', { valueEncoding: 'json' })
-    this._txs = this.db.sublevel('txs', { valueEncoding: 'utf8' })
-    this._utxos = this.db.sublevel('utxos', { valueEncoding: 'json' })
-    this._meta = this.db.sublevel('meta', { valueEncoding: 'json' })
-    this._watched = this.db.sublevel('watched', { valueEncoding: 'json' })
-    this._hashIndex = this.db.sublevel('hashIndex', { valueEncoding: 'json' })
-    this._inscriptions = this.db.sublevel('inscriptions', { valueEncoding: 'json' })
-    this._inscriptionIdx = this.db.sublevel('inscIdx', { valueEncoding: 'json' })
-    this._txStatus = this.db.sublevel('txStatus', { valueEncoding: 'json' })
-    this._txBlock = this.db.sublevel('txBlock', { valueEncoding: 'json' })
-    this._content = this.db.sublevel('content', { valueEncoding: 'json' })
-    this._tokens = this.db.sublevel('tokens', { valueEncoding: 'json' })
-    this._sessions = this.db.sublevel('sessions', { valueEncoding: 'json' })
-    this._paymentReceipts = this.db.sublevel('payment_receipts', { valueEncoding: 'json' })
-    this._spentInputs = this.db.sublevel('spentInputs', { valueEncoding: 'json' })
-    await mkdir(this._contentDir, { recursive: true })
-    this.emit('open')
+    let retried = false
+    while (true) {
+      try {
+        this.db = new Level(this.dbPath, { valueEncoding: 'json' })
+        await this.db.open()
+        this._headers = this.db.sublevel('headers', { valueEncoding: 'json' })
+        this._txs = this.db.sublevel('txs', { valueEncoding: 'utf8' })
+        this._utxos = this.db.sublevel('utxos', { valueEncoding: 'json' })
+        this._meta = this.db.sublevel('meta', { valueEncoding: 'json' })
+        this._watched = this.db.sublevel('watched', { valueEncoding: 'json' })
+        this._hashIndex = this.db.sublevel('hashIndex', { valueEncoding: 'json' })
+        this._inscriptions = this.db.sublevel('inscriptions', { valueEncoding: 'json' })
+        this._inscriptionIdx = this.db.sublevel('inscIdx', { valueEncoding: 'json' })
+        this._txStatus = this.db.sublevel('txStatus', { valueEncoding: 'json' })
+        this._txBlock = this.db.sublevel('txBlock', { valueEncoding: 'json' })
+        this._content = this.db.sublevel('content', { valueEncoding: 'json' })
+        this._tokens = this.db.sublevel('tokens', { valueEncoding: 'json' })
+        this._sessions = this.db.sublevel('sessions', { valueEncoding: 'json' })
+        this._paymentReceipts = this.db.sublevel('payment_receipts', { valueEncoding: 'json' })
+        this._spentInputs = this.db.sublevel('spentInputs', { valueEncoding: 'json' })
+        await mkdir(this._contentDir, { recursive: true })
+        this.emit('open')
+        break
+      } catch (err) {
+        // Auto-heal corrupted database (once)
+        const isCorruption = err.message && (
+          err.message.includes('Corruption') ||
+          err.message.includes('missing files') ||
+          err.message.includes('MANIFEST') ||
+          err.message.includes('bad magic number') ||
+          err.message.includes('sstable') ||
+          err.message.includes('LOCK')
+        )
+        if (isCorruption && !retried) {
+          console.error(`[WARNING] Database corruption detected: ${err.message}`)
+          console.error(`[WARNING] PID:${process.pid} - Renaming corrupted DB and rebuilding from P2P`)
+          const badDbPath = `${this.dbPath}.bad-${Date.now()}`
+          try {
+            await rename(this.dbPath, badDbPath)
+            console.log(`[RECOVERY] Corrupted DB moved to: ${badDbPath}`)
+            console.log(`[RECOVERY] Creating fresh DB - will rebuild from P2P peers`)
+            retried = true
+            continue
+          } catch (renameErr) {
+            console.error(`[FATAL] Failed to rename corrupted DB: ${renameErr.message}`)
+            throw err
+          }
+        }
+        throw err
+      }
+    }
   }
 
   /** Close the database. */
