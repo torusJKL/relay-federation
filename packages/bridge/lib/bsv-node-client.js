@@ -28,7 +28,20 @@ import { BSVPeer } from './bsv-peer.js'
 const DEFAULT_SEEDS = [
   'seed.bitcoinsv.io',
   'seed.satoshisvision.network',
-  'seed.cascharia.com'
+  'seed.cascharia.com',
+  'seed.indelible.one'
+]
+
+// Hardcoded BSV node IPs — fallback when DNS seeds are dead
+const FALLBACK_PEERS = [
+  '135.181.137.155', '198.154.93.210', '47.243.139.168',
+  '57.129.76.3', '198.154.93.204', '57.128.233.172',
+  '15.204.53.222', '95.217.38.93', '65.108.102.125',
+  '51.75.213.175', '99.127.49.102', '162.19.222.167',
+  '141.95.126.79', '162.19.138.6', '95.217.204.168',
+  '195.144.22.198', '198.154.93.212', '135.125.170.182',
+  '37.27.131.85', '15.235.232.121', '57.128.216.248',
+  '51.89.99.162', '198.154.93.195', '51.222.249.3'
 ]
 
 const DEFAULT_PORT = 8333
@@ -333,6 +346,14 @@ export class BSVNodeClient extends EventEmitter {
         }
       } catch {
         // DNS resolution failed for this seed — try others
+      }
+    }
+
+    // Always include fallback peers — DNS seeds may resolve but reject connections
+    for (const addr of FALLBACK_PEERS) {
+      if (!seen.has(addr)) {
+        seen.add(addr)
+        peers.push({ host: addr, port: this._port })
       }
     }
 

@@ -763,30 +763,6 @@ async function cmdStart () {
     }
   })
 
-  txRelay.on('tx:new', async ({ txid, rawHex }) => {
-    try { await store.putTx(txid, rawHex) } catch {}
-    try { await store.updateTxStatus(txid, 'mempool', { source: 'p2p' }) } catch {}
-    // Index inscriptions
-    try {
-      const { parseTx } = await import('./lib/output-parser.js')
-      const parsed = parseTx(rawHex)
-      for (const output of parsed.outputs) {
-        if (output.type === 'ordinal' && output.parsed) {
-          await store.putInscription({
-            txid,
-            vout: output.vout,
-            contentType: output.parsed.contentType || null,
-            contentSize: output.parsed.content ? output.parsed.content.length / 2 : 0,
-            isBsv20: output.parsed.isBsv20 || false,
-            bsv20: output.parsed.bsv20 || null,
-            timestamp: Date.now(),
-            address: output.hash160 || null
-          })
-        }
-      }
-    } catch {}
-  })
-
   // ── 6b. BSV P2P header sync — connect to BSV nodes ──────
   const { BSVNodeClient } = await import('./lib/bsv-node-client.js')
   const bsvNode = new BSVNodeClient()
@@ -822,11 +798,14 @@ async function cmdStart () {
     }
   })
 
-  // Track txids announced via BSV P2P inv (lightweight, no full tx fetch)
-  bsvNode.on('tx:inv', ({ txids }) => {
+  // Track txids announced via BSV P2P inv — only request unseen txs
+  bsvNode.on('tx:inv', ({ txids, peer }) => {
+    const unseen = []
     for (const txid of txids) {
+      if (!txRelay.hasSeen(txid)) unseen.push(txid)
       txRelay.trackTxid(txid)
     }
+    if (unseen.length > 0 && peer) peer.requestTxs(unseen)
   })
 
   // Feed raw txs from BSV P2P into the mesh relay + address watcher

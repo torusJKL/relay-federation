@@ -931,6 +931,7 @@
   @keyframes dash { to { stroke-dashoffset: -7; } }
   @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
   .tab-content > * { animation: fadeIn 0.2s ease-out; }
+  @keyframes sporeFloat { 0% { transform: translateY(0) scale(1); opacity: 0; } 10% { opacity: 0.6; } 90% { opacity: 0.3; } 100% { transform: translateY(-720px) scale(0.5); opacity: 0; } }
 </style>
 </head>
 <body>
@@ -952,6 +953,8 @@
     <button onclick="setTab('tokens')">Tokens</button>
     <button onclick="setTab('apps')">Apps</button>
     <button onclick="setTab('x402')">x402</button>
+    <button onclick="setTab('crawler')">Crawler</button>
+    <button onclick="setTab('forest')">Forest</button>
   </div>
   <div class="header-right">
     <div class="header-stats">
@@ -1102,6 +1105,8 @@ let savedExplorerInput = '';
 let savedExplorerResult = '';
 let appsData = null;
 let x402Data = null;
+let crawlerData = null;
+let forestData = null;
 let latestPrice = null;
 let mempoolHistory = [];
 let peerCountHistory = [];
@@ -1528,18 +1533,20 @@ function setTab(tab) {
   if (activeTab === 'overview' && tab !== 'overview') destroyMeshMap3D();
   activeTab = tab;
   const buttons = document.querySelectorAll('#headerTabs button');
-  const tabs = ['overview', 'mempool', 'explorer', 'inscriptions', 'tokens', 'apps', 'x402'];
+  const tabs = ['overview', 'mempool', 'explorer', 'inscriptions', 'tokens', 'apps', 'x402', 'crawler', 'forest'];
   buttons.forEach((btn, i) => btn.classList.toggle('active', tabs[i] === tab));
   renderActiveTab();
   if (tab === 'apps') setTimeout(fetchAppsData, 50);
   if (tab === 'tokens') setTimeout(fetchTokens, 50);
   if (tab === 'x402') setTimeout(fetchX402Data, 50);
+  if (tab === 'crawler') setTimeout(fetchCrawlerData, 50);
+  if (tab === 'forest') setTimeout(fetchForestData, 50);
 }
 
 function renderActiveTab(fromPoll) {
   const el = document.getElementById('tabContent');
   // Skip apps/explorer re-render during poll (preserves state)
-  if (fromPoll && (activeTab === 'apps' || activeTab === 'explorer' || activeTab === 'inscriptions' || activeTab === 'tokens' || activeTab === 'x402')) return;
+  if (fromPoll && (activeTab === 'apps' || activeTab === 'explorer' || activeTab === 'inscriptions' || activeTab === 'tokens' || activeTab === 'x402' || activeTab === 'crawler' || activeTab === 'forest')) return;
   // On poll, if overview tab has active 3D scene, just update data — don't rebuild DOM
   if (fromPoll && activeTab === 'overview' && mesh3d) {
     updateMeshMap3D();
@@ -1556,6 +1563,8 @@ function renderActiveTab(fromPoll) {
     case 'tokens': html = renderTokensTab(); break;
     case 'apps': html = renderAppsTab(); break;
     case 'x402': html = renderX402Tab(); break;
+    case 'crawler': html = renderCrawlerTab(); break;
+    case 'forest': html = renderForestTab(); break;
     default: html = renderOverviewTab();
   }
   // Only update DOM if content actually changed (prevents flash)
@@ -3221,6 +3230,327 @@ async function saveX402Settings() {
     if (r.ok) { fetchX402Data(); }
     else { var err = await r.json().catch(function() { return {}; }); alert(err.error || 'Save failed'); }
   } catch (e) { alert(e.message); }
+}
+
+// ── Crawler/DNS tab ──────────────────────────────────
+function renderCrawlerTab() {
+  let html = '<div style="margin-bottom:16px"><span style="font-size:15px;font-weight:600;color:var(--text-primary)">Crawler / DNS Seed</span>';
+  html += '<span style="font-size:11px;color:var(--text-muted);margin-left:10px">Network discovery and peer health</span></div>';
+
+  if (!crawlerData) {
+    html += '<div class="glass" style="padding:20px;color:var(--text-muted)">Loading...</div>';
+    return html;
+  }
+
+  if (!crawlerData.available) {
+    html += '<div class="glass" style="padding:30px;text-align:center"><div style="color:var(--text-dim)">Crawler not running on this bridge</div>';
+    html += '<div style="color:var(--text-dim);font-size:11px;margin-top:4px">Switch to the bridge hosting the DNS seed to view crawler data</div></div>';
+    return html;
+  }
+
+  // Summary card
+  const lastCrawl = crawlerData.lastCrawlAt ? new Date(crawlerData.lastCrawlAt).toLocaleTimeString() : '-';
+  html += '<div class="glass" style="padding:12px 16px;margin-bottom:8px;display:flex;flex-wrap:wrap;gap:20px">';
+  html += '<div><div style="font-size:10px;color:var(--text-dim)">Total Tracked</div><div style="font-size:20px;font-weight:700;color:var(--text-primary)">' + (crawlerData.totalKnown || 0).toLocaleString() + '</div></div>';
+  html += '<div><div style="font-size:10px;color:var(--text-dim)">Verified Alive</div><div style="font-size:20px;font-weight:700;color:var(--accent-green)">' + (crawlerData.verified || 0) + '</div></div>';
+  html += '<div><div style="font-size:10px;color:var(--text-dim)">DNS Domain</div><div style="font-size:13px;color:var(--accent-blue);font-family:monospace">' + escapeHtml(crawlerData.domain || '-') + '</div></div>';
+  html += '<div><div style="font-size:10px;color:var(--text-dim)">Last Crawl</div><div style="font-size:13px;color:var(--text-primary)">' + lastCrawl + '</div></div>';
+  html += '</div>';
+
+  // Bucket breakdown
+  const buckets = crawlerData.buckets || {};
+  const bucketOrder = ['success', 'no_version', 'refused', 'no_verack', 'not_bsv', 'dropped', 'error'];
+  const bucketLabels = { success: 'Alive', no_version: 'No Version Reply', refused: 'Connection Refused', no_verack: 'No Verack', not_bsv: 'Not BSV', dropped: 'Dropped', error: 'Error' };
+  const bucketColors = { success: 'var(--accent-green)', no_version: 'var(--text-dim)', refused: 'var(--accent-red)', no_verack: '#f5a623', not_bsv: '#e74c3c', dropped: '#8e8e93', error: '#ff3b30' };
+  const total = Object.values(buckets).reduce((s, v) => s + v, 0) || 1;
+
+  html += '<div class="glass" style="padding:12px 16px;margin-bottom:8px">';
+  html += '<div style="font-size:12px;font-weight:600;color:var(--text-primary);margin-bottom:8px">Failure Buckets</div>';
+  for (const key of bucketOrder) {
+    const count = buckets[key] || 0;
+    if (count === 0) continue;
+    const pct = ((count / total) * 100).toFixed(1);
+    const barWidth = Math.max(2, (count / total) * 100);
+    html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">';
+    html += '<span style="font-size:11px;color:var(--text-muted);width:120px;flex-shrink:0">' + (bucketLabels[key] || key) + '</span>';
+    html += '<div class="app-bar-bg" style="flex:1"><div class="app-bar-fill" style="width:' + barWidth + '%;background:' + (bucketColors[key] || 'var(--text-dim)') + '"></div></div>';
+    html += '<span style="font-size:11px;color:var(--text-primary);width:60px;text-align:right">' + count.toLocaleString() + ' (' + pct + '%)</span>';
+    html += '</div>';
+  }
+  html += '</div>';
+
+  // Verified peers list
+  if (crawlerData.peers && crawlerData.peers.length > 0) {
+    html += '<div class="glass" style="padding:12px 16px">';
+    html += '<div style="font-size:12px;font-weight:600;color:var(--text-primary);margin-bottom:8px">Verified Peers (' + crawlerData.peers.length + ')</div>';
+    for (const p of crawlerData.peers) {
+      const ago = p.lastSeen ? Math.round((Date.now() - p.lastSeen) / 60000) : '?';
+      html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:3px;font-size:11px">';
+      html += '<span style="color:var(--accent-green)">\u25cf</span>';
+      html += '<span style="color:var(--text-primary);font-family:monospace;flex:1">' + escapeHtml(p.host) + '</span>';
+      html += '<span style="color:var(--text-muted)">' + escapeHtml(p.userAgent || '-') + '</span>';
+      html += '<span style="color:var(--text-dim);width:60px;text-align:right">' + (p.height || '-') + '</span>';
+      html += '<span style="color:var(--text-dim);width:50px;text-align:right">' + ago + 'm ago</span>';
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+
+  return html;
+}
+
+async function fetchCrawlerData() {
+  const b = bridgeData.get(selectedBridge);
+  if (!b) return;
+  try {
+    const [healthR, peersR] = await Promise.all([
+      fetch(b._url + '/api/crawler/health', { signal: AbortSignal.timeout(5000) }),
+      fetch(b._url + '/api/crawler/peers', { signal: AbortSignal.timeout(5000) })
+    ]);
+    const health = await healthR.json();
+    const peersData = await peersR.json();
+    if (health.available) {
+      crawlerData = { ...health, peers: peersData.peers || [] };
+    } else {
+      crawlerData = { available: false };
+    }
+  } catch (e) {
+    crawlerData = { available: false, error: e.message };
+  }
+  if (activeTab === 'crawler') {
+    const el = document.getElementById('tabContent');
+    if (el) el.innerHTML = renderCrawlerTab();
+  }
+}
+
+// ── Forest tab ──────────────────────────────────────
+function renderForestTab() {
+  if (!forestData) return '<div class="glass" style="padding:20px;color:var(--text-muted)">Loading forest data...</div>';
+
+  const d = forestData;
+  const ghostTotal = d.ghostCount || 0;
+  // Limit rendered ghosts to 200 DOM nodes (sampled from ~1400)
+  const ghostRender = Math.min(ghostTotal, 200);
+
+  let html = '<div class="forest-scene" style="position:relative;width:100%;height:700px;overflow:hidden;border-radius:12px;background:#0a0e0a">';
+
+  // Background: forest floor
+  html += '<div style="position:absolute;inset:0;background:url(/art/efqco.jpg) center/cover;opacity:0.35"></div>';
+
+  // Soil line at 70% height
+  html += '<div style="position:absolute;left:0;right:0;top:70%;height:30%;background:linear-gradient(to bottom,transparent,rgba(20,15,10,0.95))"></div>';
+
+  // Underground mycelium threads (SVG)
+  html += '<svg class="forest-mycelium" style="position:absolute;left:0;top:70%;width:100%;height:30%;opacity:0.4" xmlns="http://www.w3.org/2000/svg">';
+  // Generate threads connecting bridges
+  const bCount = d.bridges ? d.bridges.length : 0;
+  for (let i = 0; i < bCount; i++) {
+    for (let j = i + 1; j < bCount; j++) {
+      const x1 = (i + 0.5) / bCount * 100;
+      const x2 = (j + 0.5) / bCount * 100;
+      const cy = 20 + Math.random() * 40;
+      html += '<path d="M' + x1 + '%,5% Q' + ((x1 + x2) / 2) + '%,' + cy + '% ' + x2 + '%,5%" fill="none" stroke="rgba(0,255,180,0.3)" stroke-width="1.5"><animate attributeName="stroke-opacity" values="0.2;0.5;0.2" dur="' + (3 + Math.random() * 4) + 's" repeatCount="indefinite"/></path>';
+    }
+  }
+  html += '</svg>';
+
+  // Ghost mushrooms — deep background, visible but faded
+  html += '<div class="forest-layer" style="position:absolute;left:0;right:0;top:10%;height:60%;pointer-events:none">';
+  for (let i = 0; i < ghostRender; i++) {
+    const x = (Math.random() * 96 + 2);
+    const y = (Math.random() * 80 + 10);
+    const s = 20 + Math.random() * 20;
+    const op = 0.08 + Math.random() * 0.07;
+    html += '<img src="/art/ghost-mushroom.png" style="position:absolute;left:' + x + '%;top:' + y + '%;width:' + s + 'px;height:auto;opacity:' + op.toFixed(2) + ';transform:translate(-50%,-100%)" alt="">';
+  }
+  html += '</div>';
+
+  // Peer mushrooms — mid layer, scattered
+  if (d.peers && d.peers.length > 0) {
+    html += '<div class="forest-layer" style="position:absolute;left:0;right:0;top:30%;height:40%">';
+    for (let i = 0; i < d.peers.length; i++) {
+      const x = 5 + (i / d.peers.length) * 90 + (Math.random() * 6 - 3);
+      const y = 40 + Math.random() * 50;
+      html += '<div class="forest-entity" style="position:absolute;left:' + x + '%;top:' + y + '%;transform:translate(-50%,-100%);cursor:pointer" title="' + escapeHtml(d.peers[i].host + ' | ' + (d.peers[i].userAgent || '?') + ' | height ' + (d.peers[i].height || '?')) + '">';
+      html += '<img src="/art/peer-mushroom.png" style="width:24px;height:auto;filter:drop-shadow(0 0 4px rgba(100,180,255,0.4))">';
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+
+  // App mushrooms — mid-ground, between bridges
+  if (d.apps && d.apps.length > 0) {
+    html += '<div class="forest-layer" style="position:absolute;left:0;right:0;top:35%;height:35%">';
+    for (let i = 0; i < d.apps.length; i++) {
+      const x = 10 + (i / d.apps.length) * 80;
+      const y = 50 + (i % 2) * 15;
+      const hStatus = d.apps[i].health?.status || 'unknown';
+      const glow = hStatus === 'up' ? 'drop-shadow(0 0 8px rgba(255,180,60,0.6))' : 'drop-shadow(0 0 4px rgba(255,180,60,0.2))';
+      html += '<div class="forest-entity" style="position:absolute;left:' + x + '%;top:' + y + '%;transform:translate(-50%,-100%);cursor:pointer;text-align:center" title="' + escapeHtml(d.apps[i].name + ' — ' + (hStatus === 'up' ? 'Healthy' : 'Down') + ' — ' + d.apps[i].url) + '">';
+      html += '<img src="/art/app-mushroom.png" style="width:40px;height:auto;filter:' + glow + '">';
+      html += '<div style="font-size:9px;color:rgba(255,200,100,0.8);margin-top:2px;white-space:nowrap">' + escapeHtml(d.apps[i].name) + '</div>';
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+
+  // Bridge mushrooms — foreground, large
+  if (d.bridges && d.bridges.length > 0) {
+    html += '<div class="forest-layer" style="position:absolute;left:0;right:0;top:30%;height:40%">';
+    for (let i = 0; i < d.bridges.length; i++) {
+      const b = d.bridges[i];
+      const x = 8 + (i / d.bridges.length) * 84;
+      const alive = b.peers > 0;
+      const glow = alive ? 'drop-shadow(0 0 12px rgba(0,255,180,0.5))' : 'drop-shadow(0 0 6px rgba(100,100,100,0.3))';
+      html += '<div class="forest-entity" style="position:absolute;left:' + x + '%;top:75%;transform:translate(-50%,-100%);cursor:pointer;text-align:center" title="' + escapeHtml(b.name + ' — ' + b.peers + ' BSV peers — height ' + b.height) + '">';
+      html += '<img src="/art/bridge-mushroom-v2.png" style="width:70px;height:auto;filter:' + glow + '">';
+      html += '<div style="font-size:10px;color:rgba(0,255,180,0.9);margin-top:2px;font-weight:600">' + escapeHtml(b.name) + '</div>';
+      html += '<div style="font-size:9px;color:var(--text-dim)">' + b.peers + ' peers | ' + b.height + '</div>';
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+
+  // Spore particles — float upward
+  html += '<div class="forest-layer" style="position:absolute;inset:0;pointer-events:none;overflow:hidden">';
+  for (let i = 0; i < 20; i++) {
+    const x = Math.random() * 100;
+    const delay = Math.random() * 8;
+    const dur = 6 + Math.random() * 6;
+    const size = 10 + Math.random() * 10;
+    html += '<img src="/art/spore-particle.png" class="forest-spore" style="position:absolute;left:' + x + '%;bottom:-10px;width:' + size + 'px;height:auto;opacity:0.7;filter:drop-shadow(0 0 4px rgba(0,255,180,0.4));animation:sporeFloat ' + dur + 's ' + delay + 's linear infinite">';
+  }
+  html += '</div>';
+
+  html += '</div>'; // .forest-scene
+
+  // Legend below
+  html += '<div style="display:flex;flex-wrap:wrap;gap:16px;margin-top:10px;padding:8px 12px" class="glass">';
+  html += '<div style="display:flex;align-items:center;gap:4px;font-size:11px"><img src="/art/bridge-mushroom-v2.png" style="width:20px;height:auto"> <span style="color:var(--text-primary)">Bridges (' + (d.bridges?.length || 0) + ')</span></div>';
+  html += '<div style="display:flex;align-items:center;gap:4px;font-size:11px"><img src="/art/app-mushroom.png" style="width:16px;height:auto"> <span style="color:var(--text-primary)">Apps (' + (d.apps?.length || 0) + ')</span></div>';
+  html += '<div style="display:flex;align-items:center;gap:4px;font-size:11px"><img src="/art/peer-mushroom.png" style="width:14px;height:auto"> <span style="color:var(--text-primary)">Wild Peers (' + (d.peers?.length || 0) + ')</span></div>';
+  html += '<div style="display:flex;align-items:center;gap:4px;font-size:11px"><img src="/art/ghost-mushroom.png" style="width:12px;height:auto;opacity:0.4"> <span style="color:var(--text-dim)">Ghosts (' + ghostTotal.toLocaleString() + ')</span></div>';
+  html += '<div style="display:flex;align-items:center;gap:4px;font-size:11px"><img src="/art/spore-particle.png" style="width:8px;height:auto"> <span style="color:var(--text-dim)">Spores — data flowing through the network</span></div>';
+  html += '</div>';
+
+  // Stats panels below forest — 3 columns
+  const totalPeers = d.bridges ? d.bridges.reduce((s, b) => s + b.peers, 0) : 0;
+  const avgHeight = d.bridges && d.bridges.length ? Math.round(d.bridges.reduce((s, b) => s + b.height, 0) / d.bridges.length) : 0;
+  const allSynced = d.bridges ? d.bridges.every(b => b.height === avgHeight) : false;
+  const buckets = d.buckets || {};
+  const crawlerAlive = d.crawlerAlive || 0;
+  const crawlerTotal = d.crawlerTotal || 0;
+
+  html += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:10px">';
+
+  // Column 1: Federation Health
+  html += '<div class="glass" style="padding:14px;font-size:11px">';
+  html += '<div style="font-size:13px;font-weight:700;color:rgba(0,255,180,0.9);margin-bottom:10px">Federation Health</div>';
+  html += '<div style="display:flex;justify-content:space-between;margin-bottom:6px"><span style="color:var(--text-muted)">Bridges</span><span style="color:var(--text-primary)">' + (d.bridges?.length || 0) + ' online</span></div>';
+  html += '<div style="display:flex;justify-content:space-between;margin-bottom:6px"><span style="color:var(--text-muted)">Total BSV Peers</span><span style="color:var(--accent-green)">' + totalPeers + '</span></div>';
+  html += '<div style="display:flex;justify-content:space-between;margin-bottom:6px"><span style="color:var(--text-muted)">Block Height</span><span style="color:var(--text-primary)">' + avgHeight.toLocaleString() + '</span></div>';
+  html += '<div style="display:flex;justify-content:space-between;margin-bottom:6px"><span style="color:var(--text-muted)">Sync</span><span style="color:' + (allSynced ? 'var(--accent-green)' : 'var(--accent-amber)') + '">' + (allSynced ? 'All synced' : 'Syncing...') + '</span></div>';
+  // Per-bridge breakdown
+  if (d.bridges) {
+    html += '<div style="height:1px;background:rgba(255,255,255,0.06);margin:8px 0"></div>';
+    for (const b of d.bridges) {
+      const dotColor = b.peers > 10 ? '#00ffb4' : b.peers > 0 ? 'var(--accent-amber)' : '#ff4444';
+      html += '<div style="display:flex;align-items:center;gap:6px;margin-bottom:3px"><div style="width:5px;height:5px;border-radius:50%;background:' + dotColor + '"></div><span style="color:var(--text-secondary);font-size:10px;flex:1">' + escapeHtml(b.name) + '</span><span style="color:var(--text-muted);font-size:10px">' + b.peers + ' peers</span></div>';
+    }
+  }
+  html += '</div>';
+
+  // Column 2: Network Crawler
+  html += '<div class="glass" style="padding:14px;font-size:11px">';
+  html += '<div style="font-size:13px;font-weight:700;color:rgba(100,180,255,0.9);margin-bottom:10px">Network Crawler</div>';
+  html += '<div style="display:flex;justify-content:space-between;margin-bottom:6px"><span style="color:var(--text-muted)">Nodes Discovered</span><span style="color:var(--text-primary)">' + crawlerTotal.toLocaleString() + '</span></div>';
+  html += '<div style="display:flex;justify-content:space-between;margin-bottom:6px"><span style="color:var(--text-muted)">Alive</span><span style="color:var(--accent-green)">' + crawlerAlive + '</span></div>';
+  html += '<div style="display:flex;justify-content:space-between;margin-bottom:6px"><span style="color:var(--text-muted)">Ghosts</span><span style="color:var(--text-dim)">' + ghostTotal.toLocaleString() + '</span></div>';
+  html += '<div style="display:flex;justify-content:space-between;margin-bottom:8px"><span style="color:var(--text-muted)">DNS Seed</span><span style="color:var(--accent-green)">seed.indelible.one</span></div>';
+  if (Object.keys(buckets).length > 0) {
+    html += '<div style="height:1px;background:rgba(255,255,255,0.06);margin:6px 0 8px"></div>';
+    html += '<div style="font-size:10px;color:var(--text-muted);margin-bottom:6px">Failure Buckets</div>';
+    const bColors = { success:'#00ffb4', refused:'#ff6b6b', no_version:'#666', no_verack:'#888', unreachable:'#555', not_bsv:'#ff4444', dropped:'#997', error:'#f44' };
+    const bTotal = Object.values(buckets).reduce((s, v) => s + v, 0) || 1;
+    for (const [k, v] of Object.entries(buckets)) {
+      const pct = (v / bTotal * 100).toFixed(1);
+      html += '<div style="display:flex;align-items:center;gap:6px;margin-bottom:3px"><div style="width:55%;height:6px;background:rgba(255,255,255,0.06);border-radius:3px;overflow:hidden"><div style="width:' + pct + '%;height:100%;background:' + (bColors[k] || '#888') + ';border-radius:3px"></div></div><span style="color:' + (bColors[k] || '#888') + ';font-size:9px;min-width:60px">' + k.replace(/_/g, ' ') + '</span><span style="color:var(--text-dim);font-size:9px">' + v + '</span></div>';
+    }
+  }
+  html += '</div>';
+
+  // Column 3: Apps
+  html += '<div class="glass" style="padding:14px;font-size:11px">';
+  html += '<div style="font-size:13px;font-weight:700;color:rgba(255,180,60,0.9);margin-bottom:10px">Apps</div>';
+  html += '<div style="display:flex;justify-content:space-between;margin-bottom:8px"><span style="color:var(--text-muted)">Deployed</span><span style="color:var(--text-primary)">' + (d.apps?.length || 0) + '</span></div>';
+  if (d.apps && d.apps.length > 0) {
+    for (const app of d.apps) {
+      const up = app.health?.status === 'up';
+      html += '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;padding:6px 8px;background:rgba(255,255,255,0.03);border-radius:6px"><div style="width:6px;height:6px;border-radius:50%;background:' + (up ? '#00ffb4' : '#ff4444') + '"></div><div style="flex:1"><div style="color:var(--text-secondary);font-size:11px">' + escapeHtml(app.name) + '</div><div style="color:var(--text-dim);font-size:9px">' + escapeHtml(app.url || '') + '</div></div><span style="font-size:9px;color:' + (up ? '#00ffb4' : '#ff4444') + '">' + (up ? 'UP' : 'DOWN') + '</span></div>';
+    }
+  } else {
+    html += '<div style="color:var(--text-dim);font-size:10px">No apps configured on this bridge</div>';
+  }
+  html += '<div style="display:flex;justify-content:space-between;margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.06)"><span style="color:var(--text-muted)">Wild Peers</span><span style="color:var(--text-primary)">' + (d.peers?.length || 0) + '</span></div>';
+  html += '</div>';
+
+  html += '</div>'; // grid
+
+  return html;
+}
+
+async function fetchForestData() {
+  const bridges = [];
+  for (const [id, b] of bridgeData) {
+    bridges.push({
+      name: b.name || id,
+      peers: b.peers?.connected || 0,
+      height: b.headers?.bestHeight || 0,
+      url: b._url
+    });
+  }
+
+  let apps = [];
+  let peers = [];
+  let ghostCount = 0;
+  let crawlerBuckets = {};
+  let crawlerAlive = 0;
+  let crawlerTotal = 0;
+
+  // Fetch apps from selected bridge
+  const sb = bridgeData.get(selectedBridge);
+  if (sb) {
+    try {
+      const r = await fetch(sb._url + '/apps', { signal: AbortSignal.timeout(5000) });
+      if (r.ok) { const d = await r.json(); apps = Array.isArray(d) ? d : (d.apps || []); }
+    } catch {}
+  }
+
+  // Fetch crawler data (peers + ghosts) — try all bridges, take first available
+  for (const [, b] of bridgeData) {
+    try {
+      const [hR, pR] = await Promise.all([
+        fetch(b._url + '/api/crawler/health', { signal: AbortSignal.timeout(3000) }),
+        fetch(b._url + '/api/crawler/peers', { signal: AbortSignal.timeout(3000) })
+      ]);
+      const health = await hR.json();
+      if (health.available) {
+        const pData = await pR.json();
+        peers = pData.peers || [];
+        crawlerBuckets = health.buckets || {};
+        crawlerAlive = health.verified || 0;
+        crawlerTotal = health.totalKnown || 0;
+        ghostCount = Object.entries(crawlerBuckets).filter(([k]) => k !== 'success').reduce((s, [, v]) => s + v, 0);
+        break; // Found crawler, stop searching
+      }
+    } catch {}
+  }
+
+  forestData = { bridges, apps, peers, ghostCount, buckets: crawlerBuckets, crawlerAlive, crawlerTotal };
+  if (activeTab === 'forest') {
+    const el = document.getElementById('tabContent');
+    if (el) el.innerHTML = renderForestTab();
+  }
 }
 
 // ── Log viewer ─────────────────────────────────────

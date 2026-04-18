@@ -31,10 +31,11 @@ export class TxRelay extends EventEmitter {
     /** @type {Set<string>} txids we've already seen (dedup) */
     this.seen = new Set()
     this._maxMempool = opts.maxMempool || 1000
+    this._seenMax = opts.maxSeen || 50000
 
     /** @type {Map<string, number>} txid → timestamp first seen via BSV P2P inv */
     this.knownTxids = new Map()
-    this._knownTxidMax = opts.maxKnownTxids || 50000
+    this._knownTxidMax = opts.maxKnownTxids || 10000
     this._knownTxidTtlMs = opts.knownTxidTtlMs || 600000 // 10 min
 
     this.peerManager.on('peer:message', ({ pubkeyHex, message }) => {
@@ -50,7 +51,7 @@ export class TxRelay extends EventEmitter {
    */
   broadcastTx (txid, rawHex) {
     if (this.seen.has(txid)) return 0
-    this.seen.add(txid)
+    this._trackSeen(txid)
     this._storeTx(txid, rawHex)
     this.emit('tx:new', { txid, rawHex })
     return this.peerManager.broadcast({ type: 'tx_announce', txid })
@@ -71,13 +72,12 @@ export class TxRelay extends EventEmitter {
    */
   trackTxid (txid) {
     if (this.knownTxids.has(txid)) return
-    this.knownTxids.set(txid, Date.now())
-    if (this.knownTxids.size > this._knownTxidMax) {
-      const now = Date.now()
-      for (const [id, ts] of this.knownTxids) {
-        if (now - ts > this._knownTxidTtlMs) this.knownTxids.delete(id)
-      }
+    // LRU eviction: when at capacity, delete oldest entry
+    if (this.knownTxids.size >= this._knownTxidMax) {
+      const oldest = this.knownTxids.keys().next().value
+      this.knownTxids.delete(oldest)
     }
+    this.knownTxids.set(txid, Date.now())
   }
 
   /**
@@ -87,6 +87,15 @@ export class TxRelay extends EventEmitter {
    */
   hasSeen (txid) {
     return this.seen.has(txid) || this.knownTxids.has(txid)
+  }
+
+  /** @private — add txid to seen set with LRU eviction */
+  _trackSeen (txid) {
+    if (this.seen.has(txid)) return
+    if (this.seen.size >= this._seenMax) {
+      this.seen.delete(this.seen.values().next().value)
+    }
+    this.seen.add(txid)
   }
 
   /** @private */
@@ -116,7 +125,7 @@ export class TxRelay extends EventEmitter {
   /** @private */
   _onTxAnnounce (pubkeyHex, msg) {
     if (this.seen.has(msg.txid)) return
-    this.seen.add(msg.txid)
+    this._trackSeen(msg.txid)
     const conn = this.peerManager.peers.get(pubkeyHex)
     if (conn) {
       conn.send({ type: 'tx_request', txid: msg.txid })

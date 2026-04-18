@@ -5,7 +5,7 @@ import { readFileSync, writeFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import https from 'node:https'
-import { parseTx } from './output-parser.js'
+import { parseTx, addressToHash160 } from './output-parser.js'
 import { scanAddress } from './address-scanner.js'
 import { handlePostData, handleGetTopics, handleGetData } from './data-endpoints.js'
 import { createPaymentGate } from './x402-middleware.js'
@@ -383,6 +383,96 @@ export class StatusServer {
   }
 
   /**
+   * Start background tx cleanup — deletes confirmed txs from PersistentStore.
+   * Runs every 5 minutes. Checks ARC for confirmation status.
+   */
+  startTxCleanup () {
+    if (!this._store) return
+    const CLEANUP_INTERVAL = 5 * 60 * 1000 // 5 minutes
+    const BATCH_SIZE = 50 // check 50 txs per cycle to avoid hammering ARC
+
+    const cleanup = async () => {
+      // Pass 1: Delete confirmed raw tx hex (existing behavior)
+      try {
+        let checked = 0
+        let deleted = 0
+        for await (const txid of this._store.listTxIds()) {
+          if (checked >= BATCH_SIZE) break
+          checked++
+          try {
+            const arcRes = await fetch(`https://arc.gorillapool.io/v1/tx/${txid}`, {
+              signal: AbortSignal.timeout(5000)
+            })
+            if (arcRes.ok) {
+              const data = await arcRes.json().catch(() => null)
+              // ARC returns txStatus: 'SEEN_ON_NETWORK' or 'MINED' etc.
+              if (data && (data.txStatus === 'MINED' || data.blockHeight > 0)) {
+                await this._store.deleteTx(txid)
+                deleted++
+              }
+            }
+          } catch {} // skip this tx on error, try next cycle
+        }
+        if (deleted > 0) {
+          console.log(`[tx-cleanup] Deleted ${deleted}/${checked} confirmed txs from PersistentStore`)
+        }
+      } catch (e) {
+        console.error('[tx-cleanup] Error:', e.message)
+      }
+
+      // Pass 2: Prune ghost UTXOs — unconfirmed UTXO txids that never got mined
+      try {
+        const utxoTxIds = await this._store.listUnspentUtxoTxIds()
+        let ghostsDeleted = 0
+        let utxosChecked = 0
+
+        for (const txid of utxoTxIds) {
+          if (utxosChecked >= BATCH_SIZE) break
+          utxosChecked++
+          try {
+            const arcRes = await fetch(`https://arc.gorillapool.io/v1/tx/${txid}`, {
+              signal: AbortSignal.timeout(5000)
+            })
+            if (arcRes.ok) {
+              const data = await arcRes.json().catch(() => null)
+              if (data && (data.txStatus === 'MINED' || data.blockHeight > 0)) {
+                continue // confirmed — keep this UTXO
+              }
+            }
+            // Not mined — delete all UTXOs from this txid
+            const utxos = await this._store.getUnspentByTxId(txid)
+            for (const u of utxos) {
+              await this._store.deleteUtxo(u.txid, u.vout)
+              ghostsDeleted++
+            }
+          } catch {} // skip on error, try next cycle
+        }
+        if (ghostsDeleted > 0) {
+          console.log(`[utxo-cleanup] Pruned ${ghostsDeleted} ghost UTXOs from ${utxosChecked} unconfirmed txids`)
+        }
+      } catch (e) {
+        console.error('[utxo-cleanup] Error:', e.message)
+      }
+    }
+
+    // First run after 60s (let bridge stabilize), then every 5 minutes
+    setTimeout(() => {
+      cleanup()
+      this._txCleanupInterval = setInterval(cleanup, CLEANUP_INTERVAL)
+    }, 60000)
+  }
+
+  /**
+   * Stop background tx cleanup.
+   */
+  stopTxCleanup () {
+    if (this._txCleanupInterval) {
+      clearInterval(this._txCleanupInterval)
+      this._txCleanupInterval = null
+    }
+  }
+
+  /**
    * Start the HTTP server on localhost.
    * @returns {Promise<void>}
    */
@@ -406,7 +496,10 @@ export class StatusServer {
         })
       })
 
-      this._server.listen(this._port, '0.0.0.0', () => resolve())
+      this._server.listen(this._port, '0.0.0.0', () => {
+        this.startTxCleanup()
+        resolve()
+      })
       this._server.on('error', reject)
     })
   }
@@ -562,7 +655,28 @@ export class StatusServer {
       return
     }
 
-    // POST /broadcast — relay a raw tx to peers
+    // GET /art/:filename — static art assets for Forest tab
+    if (req.method === 'GET' && path.startsWith('/art/')) {
+      const filename = path.slice(5)
+      if (filename.includes('..') || filename.includes('/')) {
+        res.writeHead(400)
+        res.end('Bad request')
+        return
+      }
+      const ext = filename.split('.').pop()
+      const types = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg' }
+      try {
+        const data = readFileSync(join(__dirname, '..', 'dashboard', 'art', filename))
+        res.writeHead(200, { 'Content-Type': types[ext] || 'application/octet-stream', 'Cache-Control': 'public, max-age=86400' })
+        res.end(data)
+      } catch {
+        res.writeHead(404)
+        res.end('Not found')
+      }
+      return
+    }
+
+    // POST /broadcast — relay a raw tx to peers (uses same waterfall as /api/broadcast)
     if (req.method === 'POST' && path === '/broadcast') {
       const body = await this._readBody(req)
       const { rawHex } = body
@@ -574,9 +688,51 @@ export class StatusServer {
       const buf = Buffer.from(rawHex, 'hex')
       const hash = createHash('sha256').update(createHash('sha256').update(buf).digest()).digest()
       const txid = Buffer.from(hash).reverse().toString('hex')
-      const sent = this._txRelay ? this._txRelay.broadcastTx(txid, rawHex) : 0
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ txid, peers: sent }))
+      const relayPeers = this._txRelay ? this._txRelay.broadcastTx(txid, rawHex) : 0
+
+      // Broadcast waterfall: P2P → ARC → WoC
+      let confirmed = false
+      let confirmSource = null
+
+      if (this._bsvNodeClient && this._bsvNodeClient.connectedCount > 0) {
+        try {
+          await this._bsvNodeClient.broadcastTxAndWait(rawHex, 10000)
+          confirmed = true
+          confirmSource = 'p2p'
+        } catch (e) {
+          console.error('[broadcast] P2P failed:', txid.slice(0, 16), e.message)
+        }
+      }
+      if (!confirmed) {
+        try {
+          const arcRes = await fetch('https://arc.gorillapool.io/v1/tx', {
+            method: 'POST', headers: { 'Content-Type': 'application/octet-stream' },
+            body: buf, signal: AbortSignal.timeout(10000)
+          })
+          if (arcRes.ok) { confirmed = true; confirmSource = 'arc' }
+        } catch (e) {
+          console.error('[broadcast] ARC failed:', txid.slice(0, 16), e.message)
+        }
+      }
+      if (!confirmed) {
+        try {
+          const wocRes = await fetch('https://api.whatsonchain.com/v1/bsv/main/tx/raw', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ txhex: rawHex }), signal: AbortSignal.timeout(10000)
+          })
+          if (wocRes.ok) { confirmed = true; confirmSource = 'woc' }
+        } catch (e) {
+          console.error('[broadcast] WoC failed:', txid.slice(0, 16), e.message)
+        }
+      }
+
+      if (confirmed) {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ txid, peers: relayPeers, confirmed: true, source: confirmSource }))
+      } else {
+        res.writeHead(502, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Broadcast failed — no miner accepted the transaction', txid }))
+      }
       return
     }
 
@@ -1356,6 +1512,74 @@ export class StatusServer {
       return
     }
 
+    // GET /api/bsv-peers — connected BSV P2P peer IPs (for DNS seed crawler)
+    if (req.method === 'GET' && path === '/api/bsv-peers') {
+      const list = this._bsvNodeClient ? this._bsvNodeClient.peerList : []
+      const connected = list.filter(p => p.connected && p.handshake)
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify(connected.map(p => ({
+        host: p.host,
+        height: p.bestHeight,
+        userAgent: p.userAgent
+      }))))
+      return
+    }
+
+    // GET /api/crawler/health — proxy to local crawler (Alpha only, returns available:false if no crawler)
+    if (req.method === 'GET' && path === '/api/crawler/health') {
+      try {
+        const r = await fetch('http://localhost:8053/health', { signal: AbortSignal.timeout(2000) })
+        const data = await r.json()
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ available: true, ...data }))
+      } catch {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ available: false }))
+      }
+      return
+    }
+
+    // GET /api/crawler/peers — proxy to local crawler /peers
+    if (req.method === 'GET' && path === '/api/crawler/peers') {
+      try {
+        const r = await fetch('http://localhost:8053/peers', { signal: AbortSignal.timeout(3000) })
+        const data = await r.json()
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ available: true, peers: data }))
+      } catch {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ available: false, peers: [] }))
+      }
+      return
+    }
+
+    // GET /api/address/:addr/mempool — unconfirmed txs from bridge mempool
+    const mempoolMatch = path.match(/^\/api\/address\/([13][a-km-zA-HJ-NP-Z1-9]{24,33})\/mempool$/)
+    if (req.method === 'GET' && mempoolMatch) {
+      const addr = mempoolMatch[1]
+      const results = []
+      if (this._txRelay) {
+        let hash160
+        try { hash160 = addressToHash160(addr) } catch {}
+        if (hash160) {
+          const watchSet = new Set([hash160])
+          for (const [txid, rawHex] of this._txRelay.mempool) {
+            try {
+              const parsed = parseTx(rawHex)
+              for (const out of parsed.outputs) {
+                if (out.hash160 && watchSet.has(out.hash160)) {
+                  results.push({ txid, vout: out.vout, satoshis: out.satoshis, height: -1 })
+                }
+              }
+            } catch {}
+          }
+        }
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify(results))
+      return
+    }
+
     // GET /api/address/:addr/unspent — local store first, GorillaPool fallback
     const unspentMatch = path.match(/^\/api\/address\/([13][a-km-zA-HJ-NP-Z1-9]{24,33})\/unspent$/)
     if (req.method === 'GET' && unspentMatch) {
@@ -1391,13 +1615,13 @@ export class StatusServer {
         if (this._store) {
           try { spent = await this._store.isInputSpent(u.txid, u.vout) } catch {}
         }
-        if (!spent) { seen.add(key); merged.push({ tx_hash: u.txid, tx_pos: u.vout, value: u.satoshis }) }
+        if (!spent) { seen.add(key); merged.push({ tx_hash: u.txid, tx_pos: u.vout, value: u.satoshis, height: u.height || -1 }) }
       }
 
       // Add local unspent UTXOs that GP doesn't have (unconfirmed outputs)
       for (const u of localUtxos) {
         const key = `${u.txid}:${u.vout}`
-        if (!seen.has(key)) { seen.add(key); merged.push({ tx_hash: u.txid, tx_pos: u.vout, value: u.satoshis }) }
+        if (!seen.has(key)) { seen.add(key); merged.push({ tx_hash: u.txid, tx_pos: u.vout, value: u.satoshis, height: -1 }) }
       }
 
       res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -1462,30 +1686,86 @@ export class StatusServer {
       const buf = Buffer.from(rawHex, 'hex')
       const hash = createHash('sha256').update(createHash('sha256').update(buf).digest()).digest()
       const txid = Buffer.from(hash).reverse().toString('hex')
-      const sent = this._txRelay ? this._txRelay.broadcastTx(txid, rawHex) : 0
-      // Store raw tx + mark spent inputs atomically
+
+      // Store raw tx + mark spent inputs (local cache for reads + UTXO tracking)
       if (this._store) {
         try {
           await this._store.putTx(txid, rawHex)
-          // Mark each input as spent so /unspent filters them immediately
           const parsed = parseTx(rawHex)
           for (const input of parsed.inputs) {
             await this._store.markInputSpent(input.prevTxid, input.prevVout, txid)
           }
         } catch {}
       }
-      // AddressWatcher already processes this tx via txRelay 'tx:new' event
-      // (broadcastTx above emits tx:new → AddressWatcher._processTx)
-      // Removed duplicate processTxManual call that caused double UTXO events
-      // Forward to ARC (fire-and-forget) so tx reaches miners
-      fetch('https://arc.gorillapool.io/v1/tx', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: buf,
-        signal: AbortSignal.timeout(5000)
-      }).catch(() => {})
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ txid, peers: sent }))
+
+      // Relay to other bridges (background, not a miner path)
+      const relayPeers = this._txRelay ? this._txRelay.broadcastTx(txid, rawHex) : 0
+
+      // Broadcast waterfall: P2P → ARC → WoC. Wait for confirmation at each step.
+      let confirmed = false
+      let confirmSource = null
+
+      // 1. P2P broadcast — wait for a BSV node to request the tx via getdata
+      if (!confirmed && this._bsvNodeClient && this._bsvNodeClient.connectedCount > 0) {
+        try {
+          await this._bsvNodeClient.broadcastTxAndWait(rawHex, 10000)
+          confirmed = true
+          confirmSource = 'p2p'
+        } catch (e) {
+          console.error('[broadcast] P2P failed:', txid.slice(0, 16), e.message)
+        }
+      }
+
+      // 2. ARC fallback — submit to GorillaPool miner, wait for response
+      if (!confirmed) {
+        try {
+          const arcRes = await fetch('https://arc.gorillapool.io/v1/tx', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/octet-stream' },
+            body: buf,
+            signal: AbortSignal.timeout(10000)
+          })
+          if (arcRes.ok || arcRes.status === 200) {
+            confirmed = true
+            confirmSource = 'arc'
+          } else {
+            const arcErr = await arcRes.text().catch(() => '')
+            console.error('[broadcast] ARC rejected:', txid.slice(0, 16), arcRes.status, arcErr.slice(0, 200))
+          }
+        } catch (e) {
+          console.error('[broadcast] ARC failed:', txid.slice(0, 16), e.message)
+        }
+      }
+
+      // 3. WoC fallback — last resort
+      if (!confirmed) {
+        try {
+          const wocRes = await fetch('https://api.whatsonchain.com/v1/bsv/main/tx/raw', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ txhex: rawHex }),
+            signal: AbortSignal.timeout(10000)
+          })
+          if (wocRes.ok) {
+            confirmed = true
+            confirmSource = 'woc'
+          } else {
+            const wocErr = await wocRes.text().catch(() => '')
+            console.error('[broadcast] WoC rejected:', txid.slice(0, 16), wocRes.status, wocErr.slice(0, 200))
+          }
+        } catch (e) {
+          console.error('[broadcast] WoC failed:', txid.slice(0, 16), e.message)
+        }
+      }
+
+      if (confirmed) {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ txid, peers: relayPeers, confirmed: true, source: confirmSource }))
+      } else {
+        console.error('[broadcast] ALL PATHS FAILED for', txid.slice(0, 16))
+        res.writeHead(502, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Broadcast failed — no miner accepted the transaction', txid }))
+      }
       return
     }
 

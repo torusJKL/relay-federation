@@ -215,6 +215,126 @@ export class RelayBridge {
     return this._get(`/api/address/${address}/unspent`)
   }
 
+  /**
+   * Get balance for a BSV address (sum of all UTXOs).
+   *
+   * @param {string} address — Base58 BSV address
+   * @returns {Promise<{ address: string, balance: number, utxos: number }>}
+   */
+  async getBalance (address) {
+    if (!address || address.length < 25 || address.length > 35) {
+      throw new Error('Invalid BSV address')
+    }
+    return this._get(`/api/address/${address}/balance`)
+  }
+
+  /**
+   * Fast check if a transaction was seen on the BSV network.
+   *
+   * @param {string} txid — 64-character hex transaction ID
+   * @returns {Promise<{ known: boolean, source?: string, firstSeen?: number }>}
+   */
+  async getKnownTx (txid) {
+    if (!txid || txid.length !== 64) {
+      throw new Error('txid must be a 64-character hex string')
+    }
+    return this._get(`/mempool/known/${txid}`)
+  }
+
+  /**
+   * Get current BSV/USD exchange rate.
+   *
+   * @returns {Promise<{ price: number, source: string, timestamp: number }>}
+   */
+  async getPrice () {
+    return this._get('/price')
+  }
+
+  // ─── Data Envelope Endpoints ───────────────────────────────
+
+  /**
+   * Submit a signed data envelope for relay.
+   *
+   * @param {object} envelope — Signed data envelope
+   * @param {string} envelope.topic — Topic identifier
+   * @param {object} envelope.data — Envelope data
+   * @param {string} envelope.pubkey — Publisher public key
+   * @param {string} envelope.sig — Signature
+   * @returns {Promise<{ ok: boolean }>}
+   */
+  async submitData (envelope) {
+    if (!envelope || !envelope.topic || !envelope.pubkey || !envelope.sig) {
+      throw new Error('envelope.topic, envelope.pubkey, and envelope.sig are required')
+    }
+    return this._post('/data', envelope)
+  }
+
+  /**
+   * List all data topics with summary objects.
+   *
+   * @returns {Promise<{ topics: Array<{ topic: string, count: number, latest: number }> }>}
+   */
+  async getTopics () {
+    return this._get('/data/topics')
+  }
+
+  /**
+   * Query cached data envelopes by topic.
+   *
+   * @param {string} topic — Topic identifier
+   * @param {object} [opts]
+   * @param {number} [opts.since] — Unix timestamp to query from
+   * @param {number} [opts.limit=50] — Max results
+   * @returns {Promise<{ topic: string, envelopes: Array, hasMore: boolean }>}
+   */
+  async getData (topic, opts = {}) {
+    if (!topic) {
+      throw new Error('topic is required')
+    }
+    const params = new URLSearchParams()
+    if (opts.since) params.set('since', String(opts.since))
+    if (opts.limit) params.set('limit', String(opts.limit))
+    const qs = params.toString()
+    return this._get(`/data/${topic}` + (qs ? '?' + qs : ''))
+  }
+
+  // ─── Token Endpoints ────────────────────────────────────────
+
+  /**
+   * List all deployed tokens.
+   *
+   * @returns {Promise<{ tokens: Array<{ tick: string, max: string, lim: string, dec: string }> }>}
+   */
+  async getTokens () {
+    return this._get('/tokens')
+  }
+
+  /**
+   * Get token deployment info.
+   *
+   * @param {string} tick — Token ticker (e.g. "ordi")
+   * @returns {Promise<{ tick: string, max: string, lim: string, dec: string, deployTxid: string }>}
+   */
+  async getToken (tick) {
+    if (!tick) {
+      throw new Error('tick is required')
+    }
+    return this._get(`/token/${tick}`)
+  }
+
+  /**
+   * Get token balance for a script hash.
+   *
+   * @param {string} tick — Token ticker
+   * @param {string} scriptHash — Script hash (hash160 of output script)
+   * @returns {Promise<{ tick: string, scriptHash: string, balance: string }>}
+   */
+  async getTokenBalance (tick, scriptHash) {
+    if (!tick) throw new Error('tick is required')
+    if (!scriptHash) throw new Error('scriptHash is required')
+    return this._get(`/token/${tick}/balance/${scriptHash}`)
+  }
+
   // ─── Operator Endpoints (require auth) ──────────────────────
 
   /**

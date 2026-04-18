@@ -70,6 +70,15 @@ const bridge = new RelayBridge(baseUrl, options?)
 | `backfillSessions(sessions)` | `{ ok, indexed }` | Bulk-index sessions |
 | `getRawTx(txid)` | hex string | Raw transaction hex |
 | `getUnspent(address)` | array of UTXOs | Unspent outputs for an address |
+| `getBalance(address)` | `{ address, balance, utxos }` | Total balance for an address |
+| `getKnownTx(txid)` | `{ known, source?, firstSeen? }` | Fast check if tx seen on network |
+| `getPrice()` | `{ price, source, timestamp }` | Current BSV/USD exchange rate |
+| `submitData(envelope)` | `{ ok }` | Submit a signed data envelope |
+| `getTopics()` | `{ topics }` | List all data topics |
+| `getData(topic, opts?)` | `{ topic, envelopes, hasMore }` | Query cached data envelopes |
+| `getTokens()` | `{ tokens }` | List all deployed tokens |
+| `getToken(tick)` | token info | Get token deployment details |
+| `getTokenBalance(tick, scriptHash)` | `{ balance }` | Token balance for script hash |
 
 ### Operator Methods (require `auth`)
 

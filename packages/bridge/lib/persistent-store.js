@@ -229,6 +229,24 @@ export class PersistentStore extends EventEmitter {
   }
 
   /**
+   * Delete a raw transaction from local store (after blockchain confirmation).
+   * @param {string} txid
+   */
+  async deleteTx (txid) {
+    try { await this._txs.del(txid) } catch {}
+  }
+
+  /**
+   * Iterate all stored txids (for cleanup).
+   * @returns {AsyncIterable<string>} txid keys
+   */
+  async * listTxIds () {
+    for await (const key of this._txs.keys()) {
+      yield key
+    }
+  }
+
+  /**
    * Check if a transaction exists.
    * @param {string} txid
    * @returns {Promise<boolean>}
@@ -259,6 +277,41 @@ export class PersistentStore extends EventEmitter {
     if (utxo === undefined) return
     utxo.spent = true
     await this._utxos.put(key, utxo)
+  }
+
+  /**
+   * Delete a UTXO record entirely (for ghost cleanup).
+   * @param {string} txid
+   * @param {number} vout
+   */
+  async deleteUtxo (txid, vout) {
+    const key = `${txid}:${vout}`
+    try { await this._utxos.del(key) } catch {}
+  }
+
+  /**
+   * List unique txids from all unspent UTXOs (for cleanup validation).
+   * @returns {Promise<string[]>}
+   */
+  async listUnspentUtxoTxIds () {
+    const txids = new Set()
+    for await (const [, utxo] of this._utxos.iterator()) {
+      if (!utxo.spent) txids.add(utxo.txid)
+    }
+    return [...txids]
+  }
+
+  /**
+   * Get all unspent UTXOs for a given txid (for cleanup).
+   * @param {string} txid
+   * @returns {Promise<Array<{ txid: string, vout: number }>>}
+   */
+  async getUnspentByTxId (txid) {
+    const utxos = []
+    for await (const [, utxo] of this._utxos.iterator()) {
+      if (!utxo.spent && utxo.txid === txid) utxos.push(utxo)
+    }
+    return utxos
   }
 
   /**

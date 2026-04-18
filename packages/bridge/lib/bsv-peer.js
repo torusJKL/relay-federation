@@ -31,7 +31,7 @@ import { createHash, randomBytes } from 'node:crypto'
 // BSV mainnet magic bytes
 const MAGIC = Buffer.from('e3e1f3e8', 'hex')
 const PROTOCOL_VERSION = 70016
-const USER_AGENT = '/Bitcoin SV:1.1.0/'
+const USER_AGENT = '/Indelible Bridge:0.3.52/'
 const HEADER_BYTES = 80
 const MSG_HEADER_SIZE = 24
 
@@ -494,6 +494,9 @@ export class BSVPeer extends EventEmitter {
       case 'getdata':
         this._onGetdata(payload)
         break
+      case 'getheaders':
+        this._onGetheaders(payload)
+        break
       case 'addr':
         this._onAddr(payload)
         break
@@ -656,15 +659,18 @@ export class BSVPeer extends EventEmitter {
 
     if (txids.length > 0) {
       this.emit('tx:inv', { txids, peer: this })
-      // Request full tx data per whitepaper Section 5.4:
-      // "When a full node announces transactions via inv,
-      //  the SPV client responds with getdata to request the full data."
-      this.requestTxs(txids)
     }
   }
 
   _onPing (payload) {
     this._sendMessage('pong', payload)
+  }
+
+  _onGetheaders (payload) {
+    // BSV 1.2.x peers ask us for headers; reply with empty headers (count=0)
+    // so they don't drop us. We're a bridge, not a header server.
+    const reply = Buffer.from([0x00]) // varint: 0 headers
+    this._sendMessage('headers', reply)
   }
 
   _onAddr (payload) {
@@ -782,7 +788,7 @@ export class BSVPeer extends EventEmitter {
     let offset = 0
 
     payload.writeInt32LE(PROTOCOL_VERSION, offset); offset += 4
-    payload.writeBigUInt64LE(0n, offset); offset += 8
+    payload.writeBigUInt64LE(0n, offset); offset += 8 // services = 0 (not a full node)
     const now = BigInt(Math.floor(Date.now() / 1000))
     payload.writeBigUInt64LE(now, offset); offset += 8
     offset += writeNetAddr(payload, offset, 1n, this._host || '127.0.0.1', this._port || 8333)
