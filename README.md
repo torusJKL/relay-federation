@@ -1,6 +1,6 @@
 # Relay Federation
 
-A federated mesh network for BSV. Each bridge is a lightweight SPV node that syncs headers, verifies transactions with Merkle proofs, indexes inscriptions and tokens, and serves a full REST API — no full node required. Bridges discover each other on-chain, peer over WebSocket, and share data across the mesh. Run your own infrastructure in three commands.
+A federated mesh network OF SPV NODES for BSV. Each bridge is a lightweight SPV node that syncs headers, verifies transactions with Merkle proofs, indexes inscriptions and tokens, and serves a full REST API — no full node required. Bridges discover each other on-chain, peer over WebSocket, and share data across the mesh. Run your own infrastructure in three commands.
 
 ## Features
 
