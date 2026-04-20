@@ -23,7 +23,7 @@ A federated mesh network of lightweight SPV bridge nodes for BSV. Each bridge:
 - Connects to 15-25 BSV full nodes via native P2P protocol (port 8333)
 - Accepts inbound connections from BSV nodes — bridges are peers, not parasites
 - Syncs 945,000+ block headers and verifies Merkle proofs
-- Relays novel transactions with 52-69% hit rates — earning eviction protection from full nodes
+- Relays novel transactions with 78-98% hit rates — earning eviction protection from full nodes
 - Discovers other bridges on-chain via CBOR-encoded OP_RETURN registry
 - Peers with other bridges over WebSocket (port 18333) with cryptographic identity
 - Serves apps via REST API (port 9333) with optional x402 micropayments
@@ -37,15 +37,31 @@ No full node. No third-party API. No single point of failure.
 
 | Bridge | Location | BSV Peers | Novel Relay | Role |
 |--------|----------|-----------|-------------|------|
-| alpha | Dallas, TX | 12-18 | 52% hit rate | General |
-| beta | New Jersey | 17-20 | 69% hit rate | General |
-| gamma | Chicago, IL | 4-6 | 52% hit rate | General |
-| delta | Dallas, TX | 3-20 | moderate | General |
-| epsilon | Atlanta, GA | 4-20 | moderate | General |
-| bridge-6 | Silicon Valley | 3-5 | active | General |
-| bridge-7 | Silicon Valley | 4-7 | 15% | DNS seed crawler |
+| 1 | Dallas, TX | 12-18 | 52% hit rate | General |
+| 2 | New Jersey | 17-20 | 69% hit rate | General |
+| 3 | Chicago, IL | 4-6 | 52% hit rate | General |
+| 4 | Dallas, TX | 3-20 | moderate | General |
+| 5 | Atlanta, GA | 4-20 | moderate | General |
+| 6 | Silicon Valley | 3-5 | active | General |
+| 7 | Silicon Valley | 4-7 | 15% | DNS seed crawler |
 
-All bridges registered on-chain with 1M sat stake bonds. All managed by systemd. All running `NODE_OPTIONS='--max-old-space-size=2048'`.
+All bridges registered on-chain with 1M sat Surety bond. All managed by systemd. All running `NODE_OPTIONS='--max-old-space-size=2048'`.
+
+What is a Surety Bond?
+
+Surety Bond (BND)
+This is NOT proof-of-stake. There is no staking, no delegation, and no block rewards.
+
+A surety bond is economic collateral. Bridge operators lock BSV to their own address as a signal of commitment. The bond UTXO is monitored on-chain — if a bridge spends its bond, the network flags it and its reputation score drops.
+
+Think of it like a security deposit: you get it back when you leave, but spending it while active tells the network you may not be serious.
+
+How BND score works:
+
+Bond amount — more BSV locked = higher score
+Bond age — longer held unspent = more trust
+Minimum bond: 0.01 BSV (1,000,000 satoshis)
+BSV disabled OP_CHECKLOCKTIMEVERIFY at Genesis (Feb 2020), so script-level timelocks are not possible. Enforcement is done by monitoring the UTXO.
 
 ### Live Apps
 
