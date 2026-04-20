@@ -1,8 +1,8 @@
-# Federated SPV Relay Mesh: An Open Protocol for Decentralised Transaction Relay on Bitcoin SV
+# The Indelible Federation: A Federated SPV Relay Mesh for Bitcoin SV
 
 **zcooL**
 
-**February 2026** (Revised: March 14, 2026 — v4: added data relay layer for ephemeral signed data envelopes with topic-filtered gossip, TTL-bounded storage, and pull-based catch-up. v3: added indexing layer with tx confirmation tracking, Merkle proof storage, BSV-20 token indexing, content-addressed inscription storage, historical backfill, and price feed. v2: on-chain registry, stake bonds, peer scoring, cryptographic handshake, gossip protocol, protocol parsing. Reframed as open BSV developer infrastructure.)
+**February 2026** (Revised: April 19, 2026 — v5: P2P peer retention research and four protocol-level fixes informed by reading the BSV node C++ source code alongside bridge JavaScript; inbound P2P listening on port 8333; novel transaction relay with immediate `inv` forwarding and shared tx cache; good peer persistence; DNS seed crawler and `seed.indelible.one`; BCH blacklist; x402 HTTP 402-based payment middleware; mesh WebSocket port moved from 8333 to 18333; systemd integration; deployment expanded to seven geographically distributed bridges; Wood Wide Web framing — bridges as mycelium, apps as trees, transactions as nutrients. v4: data relay layer. v3: indexing layer. v2: on-chain registry, stake bonds, peer scoring, cryptographic handshake, gossip protocol, protocol parsing.)
 
 ---
 
@@ -14,7 +14,9 @@ The architecture comprises: (1) a P2P layer speaking native Bitcoin protocol ver
 
 Bridge identity is tied to a BSV keypair. Registration is published on-chain via CBOR-encoded OP_RETURN transactions. Stake bonds lock satoshis to the bridge operator's own address as proof of BSV ownership. Peer scoring -- computed locally by each bridge with no central authority -- weights data accuracy (40%), uptime (30%), response time (20%), and stake age (10%). Peers below a threshold score are auto-disconnected.
 
-The system operates in production across geographically distributed nodes, deployed in production for the Indelible platform (indelible.one) as a reference implementation. Each bridge connects to 250+ Bitcoin full nodes via native P2P peer exchange (`getaddr`/`addr`), maintains header chain synchronisation across 939,000+ blocks, and processes transaction broadcasts without dependence on any third-party API services. The protocol is open -- any developer can run a bridge, register on-chain, and join the mesh.
+The system operates in production across seven geographically distributed bridges (Dallas, New Jersey, Chicago, Atlanta, Silicon Valley, and two additional nodes), deployed for the Indelible platform (indelible.one) as a reference implementation. Each bridge connects to 15-25 Bitcoin full nodes via native P2P peer exchange (`getaddr`/`addr`) and accepts inbound connections from BSV nodes on port 8333, maintains header chain synchronisation across 945,000+ blocks, and processes transaction broadcasts without dependence on any third-party API services. The protocol is open -- any developer can run a bridge, register on-chain, and join the mesh.
+
+The architecture mirrors a pattern 1.5 billion years old. Underground fungal networks called mycelium connect every tree in a forest -- routing nutrients, sharing resources, self-healing when threads are severed. Bridges are the mycelium. Applications are the trees. Transactions are the nutrients. The federation is a Wood Wide Web for Bitcoin.
 
 ---
 
@@ -28,7 +30,11 @@ This isolation is a material problem for any developer building on BSV. Every bl
 
 The relay mesh fills this gap. It provides BSV developers with a third option: run a lightweight bridge node that peers with other bridges, syncs headers, and relays transactions -- all without storing the full blockchain. The protocol is open. Any developer can run a bridge, register it on-chain with a stake bond, and join the mesh. Discovery is decentralised: bridges find each other by scanning the BSV blockchain for registry transactions. Trust is local: each bridge scores its peers independently based on observed behaviour, with no central reputation authority.
 
-The system was designed and first deployed for the Indelible platform (indelible.one), which stores AI conversation memory, encrypted files, and project archives permanently on the Bitcoin SV blockchain. The relay mesh proved that federated SPV infrastructure can serve production blockchain applications with sub-second latency and zero third-party dependencies. This paper describes the architecture, protocol, and production deployment as a reference for the broader BSV developer community.
+The system was designed and first deployed for the Indelible platform (indelible.one), which stores AI conversation memory, encrypted files, and project archives permanently on the Bitcoin SV blockchain. The relay mesh proved that federated SPV infrastructure can serve production blockchain applications with sub-second latency and zero third-party dependencies.
+
+The architecture converges on patterns found in nature. Underground fungal networks called mycelium connect every tree in a forest — routing nutrients, sharing resources, self-healing when threads are severed. The federation mirrors this structure: bridges are mycelium threads, applications are trees that tap into the mesh, and transactions are the nutrients flowing through the network. This convergence is not aesthetic — it is structural. Distributed resource sharing with no central authority, evolved over 1.5 billion years in forests, produces the same topology when implemented in software. Section 19 develops this parallel in detail.
+
+This paper describes the architecture, protocol, and production deployment as a reference for the broader BSV developer community.
 
 ---
 
@@ -62,7 +68,7 @@ This means that the entire class of SPV implementations relying on bloom filters
 
 Wright's paper on overlay network architectures [3] (Section 3, "Network Architecture") describes a structured approach to node-to-node communication layered above the base Bitcoin protocol. The paper details Pastry DHT routing for efficient message delivery, reputation scoring for peer quality assessment, formal node admission protocols, the S-net overlay for structured communication, and mechanisms for eclipse attack resistance.
 
-This work provided the conceptual blueprint for the federation layer described in this paper. The current implementation realises several of the mechanisms Wright described: reputation scoring (Section 11.8), node admission via on-chain registration and stake bonds (Sections 7.2-7.3), and cryptographic identity verification (Section 7.5). The system uses a gossip-based peer discovery model rather than full Pastry DHT routing, with DHT routing deferred as future work for larger mesh sizes.
+This work provided the conceptual blueprint for the federation layer described in this paper. The current implementation realises several of the mechanisms Wright described: reputation scoring (Section 11.7), node admission via on-chain registration and stake bonds (Sections 7.2-7.3), and cryptographic identity verification (Section 7.5). The system uses a gossip-based peer discovery model rather than full Pastry DHT routing, with DHT routing deferred as future work for larger mesh sizes.
 
 ---
 
@@ -72,14 +78,26 @@ The system is organised into eight distinct layers, each with a dedicated module
 
 | Layer | Module | Protocol | Port | Purpose |
 |-------|--------|----------|------|---------|
-| P2P | `bsv-peer.js` | TCP (Bitcoin) | 8333 | Wire-level Bitcoin protocol: binary message framing, checksum validation, handshake |
-| SPV Client | `bsv-node-client.js` | TCP (Bitcoin) | 8333 | Peer management, transaction broadcast via `inv`/`getdata`/`tx`, transaction lookup |
+| P2P | `bsv-peer.js` | TCP (Bitcoin) | 8333 | Wire-level Bitcoin protocol: binary message framing, checksum validation, handshake. Both outbound and inbound connections. |
+| SPV Client | `bsv-node-client.js` | TCP (Bitcoin) | 8333 | Peer management, transaction broadcast via `inv`/`getdata`/`tx`, transaction lookup, novel tx relay, good peer persistence |
 | Header Sync | (integrated) | TCP (Bitcoin) | 8333 | Block header download, LevelDB dual-index storage (by height and hash) |
 | Indexing | `persistent-store.js` | LevelDB | — | Tx confirmation tracking, Merkle proofs, BSV-20 tokens, CAS inscription storage, backfill |
-| API | `status-server.js` | HTTP, WebSocket | 9333 | REST API, WebSocket interface, operator dashboard |
-| Data Relay | `data-relay.js`, `data-endpoints.js` | WebSocket, HTTP | 8333, 9333 | Ephemeral signed data envelopes: topic-filtered gossip, TTL-bounded storage, pull-based catch-up |
-| Federation | `handshake.js`, `gossip.js`, `peer-scorer.js`, `registry` | WebSocket, BSV OP_RETURN | 8333 | On-chain registration, cryptographic peering, gossip discovery, local peer scoring |
-| Supervision | (integrated) | — | — | Crash resilience, post-restart recovery |
+| API | `status-server.js` | HTTP, WebSocket | 9333 | REST API, WebSocket interface, operator dashboard, x402 payment middleware |
+| Data Relay | `data-relay.js`, `data-endpoints.js` | WebSocket, HTTP | 18333, 9333 | Ephemeral signed data envelopes: topic-filtered gossip, TTL-bounded storage, pull-based catch-up |
+| Federation | `handshake.js`, `gossip.js`, `peer-scorer.js`, `registry` | WebSocket, BSV OP_RETURN | 18333 | On-chain registration, cryptographic peering, gossip discovery, local peer scoring |
+| Supervision | (integrated) | — | — | Crash resilience, self-healing, systemd integration |
+
+### 3.1 Port Layout
+
+The bridge uses three ports, each serving a distinct protocol layer:
+
+| Port | Protocol | Purpose |
+|------|----------|---------|
+| 8333 | TCP (Bitcoin P2P) | Outbound connections to BSV full nodes and inbound connections from BSV nodes. Standard Bitcoin port — BSV nodes expect peers here. |
+| 18333 | WebSocket | Bridge-to-bridge mesh peering: cryptographic handshake, gossip, transaction relay, header sharing, data envelopes, session sync. |
+| 9333 | HTTP | REST API for applications, operator dashboard, x402 payment endpoint. |
+
+Port 8333 was originally shared between BSV P2P and federation mesh WebSocket. This created a conflict: BSV nodes connecting inbound expected Bitcoin protocol, but the port was serving WebSocket. The port split to 18333 for mesh and 8333 exclusively for Bitcoin P2P resolved this and enabled inbound P2P listening (Section 4.3).
 
 The layers are ordered by proximity to the Bitcoin network. The P2P layer handles the raw wire protocol. The SPV client manages peer connections and transaction operations. The header sync maintains the complete chain of block headers. The indexing layer tracks transaction lifecycle, stores Merkle proofs, indexes BSV-20 tokens, and manages content-addressed inscription storage. The data relay layer propagates ephemeral signed data envelopes between bridges via topic-filtered gossip. The API layer faces outward to application clients. The federation layer provides bridge-to-bridge communication, identity, and trust. The supervision layer ensures crash recovery.
 
@@ -97,18 +115,32 @@ The P2P layer (`bsv-peer.js`) implements the Bitcoin peer-to-peer protocol at th
 
 Messages are framed with the BSV mainnet magic bytes (`0xe3e1f3e8`), followed by a 12-byte null-padded command string, a 4-byte little-endian payload length, a 4-byte checksum (the first four bytes of the double-SHA256 of the payload), and the payload itself.
 
-The system uses protocol version 70016, the current BSV protocol version that includes support for large messages, and identifies itself with user agent `/Bitcoin SV:1.1.0/`. These values must match expectations of BSV full nodes; non-standard user agents or protocol versions can result in connection rejection.
+The system uses protocol version 70016, the current BSV protocol version that includes support for large messages, and identifies itself with user agent `/Indelible Bridge:0.3.60/`. Testing confirmed that user agent string does not affect peer retention — BSV nodes do not discriminate based on user agent during eviction decisions (Section 5.6).
+
+### 4.1.1 Services Bitmask: Why Bridges Must Not Claim NODE_NETWORK
+
+The `version` message includes a `services` bitmask. Setting `services=1n` claims `NODE_NETWORK` — advertising that this node stores the full blockchain and can serve arbitrary blocks on request. BSV full nodes expect `NODE_NETWORK` peers to respond to `getdata MSG_BLOCK` requests. When a bridge claiming `NODE_NETWORK` cannot serve blocks, the requesting node marks it as misbehaving.
+
+The bridge sets `services=0n` (`NODE_NONE`), correctly advertising that it is a pure SPV client. This is not a limitation but a protocol-level truth: the bridge syncs headers and relays transactions, but does not store or serve full blocks. Setting the honest value eliminates an entire class of disconnection caused by BSV nodes discovering the lie.
 
 ### 4.2 Connection Handshake
 
 Connection establishment follows the Bitcoin protocol handshake:
 
 1. The bridge opens a TCP connection to a full node on port 8333.
-2. The bridge sends a `version` message containing its protocol version, services bitmask (set to 0, `NODE_NONE`, as the bridge is a pure SPV client), timestamp, and current block height.
+2. The bridge sends a `version` message containing its protocol version, services bitmask (set to `0n`, `NODE_NONE`), timestamp, and **current block height** — the bridge's actual synced header height, not a stale value. Advertising a height thousands of blocks behind the chain tip causes immediate deprioritisation by full nodes (see Section 5.6, Fix 1).
 3. The full node responds with its own `version` message, including its best block height.
 4. The bridge sends a `verack` (version acknowledgement) message.
 5. The bridge immediately sends a `protoconf` message advertising its maximum receive payload size (2MB), as required by protocol version 70016 and above.
 6. The full node may send `authch` (authentication challenge) messages related to MinerID. These are ignored silently. Per the BSV node source code, connections proceed even if authentication is not completed. Non-mining SPV clients have no MinerID key and cannot sign authentication challenges.
+
+### 4.3 Inbound P2P Listening
+
+Bridges accept inbound TCP connections from BSV full nodes on port 8333. When an inbound connection arrives, the bridge waits for the remote node's `version` message, validates it (rejecting non-BSV clients — see Section 5.7), sends its own `version` and `verack`, then promotes the connection to a full peer.
+
+After establishing any outbound connection, the bridge sends a `sendSelfAddr()` message — an `addr` message containing its own public IP and port 8333. This advertises the bridge's existence to the BSV node's address manager (`addrman`), making the bridge discoverable by other BSV nodes via `getaddr`/`addr` peer exchange. Over time, the bridge's address propagates through the BSV network's gossip layer, attracting additional inbound connections without active solicitation.
+
+This transforms bridges from passive consumers to active participants in the BSV network topology. A bridge that both connects outbound and accepts inbound occupies a structural position in the network graph — closer to a peer than a client.
 
 ### 4.3 Message Handling
 
@@ -122,13 +154,35 @@ The SPV client layer (`bsv-node-client.js`) manages peer connections and transac
 
 ### 5.1 Peer Discovery
 
-Peers are discovered through two mechanisms that operate in sequence:
+Peers are discovered through four mechanisms that operate in sequence:
 
-1. **DNS Seeds**: On startup, the bridge resolves DNS seed addresses from `seed.bitcoinsv.io`, `seed.satoshisvision.network`, and `seed.cascharia.com`. This typically yields 3-5 unique IP addresses for initial bootstrap.
+1. **Good peer persistence**: On startup, the bridge loads `good-peers.json` from its data directory. These are peers that proved reliable in previous sessions — specifically, peers that sent valid block headers, confirming they speak BSV protocol and maintain current chain state. Good peers are tried first, before any other discovery mechanism, giving the bridge a warm start after restarts.
 
-2. **Native P2P Peer Exchange (`getaddr`/`addr`)**: After completing the handshake with each initial peer, the bridge sends a `getaddr` message -- the Bitcoin protocol's built-in peer discovery mechanism. Each connected node responds with an `addr` message containing the IP addresses and ports of all nodes in its address book. The bridge parses these `addr` messages (30-byte entries: 4 bytes timestamp, 8 bytes services, 16 bytes IPv4-mapped IPv6 address, 2 bytes port), filters for IPv4 nodes on port 8333, and connects to each new peer. Those new peers also respond to `getaddr` with their own address books, creating a cascading discovery effect that rapidly maps the entire reachable network.
+2. **DNS Seeds**: The bridge resolves DNS seed addresses from `seed.bitcoinsv.io`, `seed.satoshisvision.network`, `seed.cascharia.com`, and `seed.indelible.one` (the federation's own DNS seed, populated by the crawler described in Section 5.8).
 
-This two-stage approach -- DNS bootstrap followed by native P2P peer exchange -- eliminates all third-party API dependencies for peer discovery. The `getaddr`/`addr` approach uses the peer exchange protocol Nakamoto built into Bitcoin itself, discovers significantly more peers (250+ versus 12-14 with API-based approaches), and operates with zero external dependencies.
+   The state of BSV's legacy DNS seed infrastructure as of April 2026:
+
+   | Seed | Status |
+   |------|--------|
+   | `seed.bitcoinsv.io` | 3 IPv4 addresses |
+   | `dnsseed.bitcoinsv.io` | Dead — domain does not exist |
+   | `seed.cascharia.com` | Resolves, returns nothing |
+   | `dnsseed.cascharia.com` | Resolves, returns nothing |
+   | `seed.satoshisvision.network` | 2 IPv4 addresses |
+   | `dnsseed.satoshisvision.network` | Dead — domain does not exist |
+   | **`seed.indelible.one`** | **26+ verified-alive peers (federation crawler)** |
+
+   Five peers from six legacy seeds. Two domains no longer exist. Two return empty responses. This is the DNS seed crisis that prompted the federation to build its own crawler and DNS seed (Section 5.8) — the network's reproductive system. The federation seed at `seed.indelible.one` provides 26+ verified-alive peers.
+
+3. **Native P2P Peer Exchange (`getaddr`/`addr`)**: After completing the handshake with each peer, the bridge sends a `getaddr` message -- the Bitcoin protocol's built-in peer discovery mechanism. Each connected node responds with an `addr` message containing the IP addresses and ports of all nodes in its address book. The bridge parses these `addr` messages (30-byte entries: 4 bytes timestamp, 8 bytes services, 16 bytes IPv4-mapped IPv6 address, 2 bytes port), filters for IPv4 nodes on port 8333, and connects to each new peer. Those new peers also respond to `getaddr` with their own address books, creating a cascading discovery effect.
+
+4. **On-chain beacon backfill**: On startup, each bridge scans the beacon address (`1KhH4VshyN8PnzxbTSjiojcQbbABNSZyzR`) for registration transactions. This discovers all bridges that registered before this bridge came online. Combined with gossip propagation of new registrations, this provides zero-configuration mesh discovery.
+
+The four-stage approach — warm start from persisted good peers, DNS seeds (including the federation's own), native P2P peer exchange, and on-chain beacon discovery — eliminates all third-party API dependencies for peer discovery. If every legacy DNS seed dies tomorrow, the federation continues discovering peers through its own seed, its own crawler, persisted good peers, and the on-chain registry.
+
+### 5.1.1 Stagger Connect
+
+Connecting to many peers simultaneously triggers rate-limiting behaviour in BSV nodes. The bridge connects in batches of 4 peers with 2-second delays between batches. This stagger applies to both initial startup connection and periodic maintenance cycles.
 
 ### 5.2 Transaction Broadcasting
 
@@ -145,13 +199,111 @@ This procedure is repeated to all connected peers. In the current deployment, tr
 
 Transactions are fetched using `getdata` with inventory type `MSG_TX` (1). The SPV client constructs an inventory vector containing the desired transaction identifier, sends the `getdata` message, and waits for the corresponding `tx` response. If the remote peer does not possess the transaction, it responds with a `notfound` message. The SPV client handles `notfound` explicitly, resolving the request as not-found immediately rather than waiting for a 10-second timeout.
 
-### 5.4 Inventory Handling
+### 5.4 Inventory Handling and Novel Transaction Relay
 
-When a full node announces new transactions or blocks via `inv`, the SPV client responds with `getdata` to request the full data. Block inventory triggers a header re-synchronisation to update the local chain tip.
+When a full node announces new transactions via `inv`, the bridge does two things simultaneously:
+
+1. **Requests the full transaction** via `getdata MSG_TX` to obtain the raw bytes.
+2. **Immediately forwards the `inv`** to all other connected BSV peers, before downloading the full transaction.
+
+This immediate relay is critical for peer retention (Section 5.6). The bridge maintains a `seenTxids` Set for deduplication — each txid is tracked for 2 minutes before being pruned by a cleanup timer. When a peer subsequently requests the full transaction via `getdata`, the bridge serves it from a shared transaction cache (`_txCache`) accessible to all peer connections. This shared cache means any peer can serve a transaction that any other peer received — the cache is not per-connection.
+
+Block inventory triggers a header re-synchronisation to update the local chain tip.
+
+#### Cross-Protocol Relay: Mesh to P2P
+
+Transactions arriving on the federation mesh (WebSocket, port 18333) are relayed to BSV peers (TCP, port 8333) using the same `inv`/`getdata`/`tx` flow. Without this cross-protocol relay, federation traffic generates zero novel relay credit with BSV nodes. The bridge treats mesh-originated transactions identically to P2P-originated ones for relay purposes.
 
 ### 5.5 Address Watching
 
 The SPV client maintains a set of watched addresses. When a transaction arrives (via `getdata` response or peer announcement), the client decodes it and checks whether any output script contains the hash160 of a watched address. Matching transactions are stored in a local LevelDB and emit events to subscribed clients.
+
+### 5.6 P2P Peer Retention: Reading the BSV Source Code
+
+Early bridge deployments suffered from peer attrition — connections lasting minutes, not hours. Bridges maintained 0-3 peers and could not sustain reliable transaction relay. Understanding why required reading the BSV full node source code (C++, `bitcoin-sv-1.1.1`) alongside the bridge code (JavaScript) — two codebases in two languages solving the same problem from opposite sides of the same protocol.
+
+#### The Eviction Algorithm
+
+BSV full nodes decide which peers to keep using `AttemptToEvictConnection` in `src/net/net.cpp`. The algorithm protects peers across five layers:
+
+| Layer | Protected Peers | Criteria |
+|-------|----------------|----------|
+| Netgroup diversity | 4 | Different /16 subnets |
+| Best ping | 8 | Lowest latency |
+| **Novel tx relay** | **4** | **Most recent `nLastTXTime` — only set when delivering a tx the node has never seen** |
+| Block relay | 4 | Most recent block delivery |
+| Longest connected | 50% of remaining | Uptime |
+
+Layer 3 is the critical one. `nLastTXTime` is set only when a peer delivers a transaction the full node has **never seen before**. The first relayer wins. Every subsequent relayer of the same transaction gets nothing. If a bridge never relays novel transactions, it has zero eviction protection in this layer and gets kicked within minutes.
+
+#### The AddrMan Penalty System
+
+`addrman.cpp` implements a separate reputation system for connection attempts:
+
+- `GetChance()` applies a 99% penalty for peers retried within 10 minutes — `0.01 * nSinceLastTry` scaling.
+- 3 failed connection attempts mark a peer as "terrible" via `IsTerrible()`.
+- Each failure applies an exponential 0.66x backoff (max 8 failures = 1/256 of normal selection chance).
+- These penalties affect reconnection priority, not banning. A bridge that reconnects aggressively does not get banned — it gets deprioritised into near-zero selection probability.
+
+#### Four Fixes
+
+Armed with this understanding, four protocol-level fixes were implemented:
+
+**Fix 1 — Header sync before pack.** The bridge advertised block height ~930,000 in its `version` message handshake. The BSV chain tip was ~945,500. Full nodes saw the bridge as 15,000 blocks behind — a stale node not worth keeping. The fix: connect to one peer first, sync headers to the current chain tip, then connect to remaining peers advertising the real height. Result: one bridge went from 3 peers to 20 within 10 minutes of deploying this fix.
+
+**Fix 2 — Immediate inv relay.** When the bridge received an `inv` from a peer, it downloaded the full transaction before announcing to other peers. By then, another node had already relayed the same `inv`. The bridge lost the `nLastTXTime` race every time. The fix: forward the `inv` immediately, download the full tx in parallel. Store it in the shared tx cache so it can be served when `getdata` arrives from other peers. Result: novel relay acceptance went from 0% to 98%.
+
+**Fix 3 — Mesh-to-P2P relay.** Transactions arriving on the federation mesh (WebSocket, port 18333) were logged but never forwarded to BSV peers (TCP, port 8333). The entire federation's transaction traffic generated zero novel relay credit. The fix: wire the mesh transaction handler to the P2P relay path. All mesh transactions are now relayed to BSV peers using the same `inv`/`getdata`/`tx` flow.
+
+**Fix 4 — Maintain cycle guard.** The peer maintenance timer fired every 60 seconds, but each cycle took 73 seconds (145 addresses × 4/batch × 2s delay). Three concurrent cycles ran simultaneously — 435 connection attempts per minute. Combined with a bug where "good peers" bypassed all cooldown timers, this created a reconnection storm that triggered AddrMan's deprioritisation penalties. The fix: a concurrency guard allowing only one maintenance cycle at a time, base cooldown raised from 5 seconds to 120 seconds (exceeding the 60-second timer interval), max 20 connections per cycle, and demotion of good peers after 3 consecutive failures.
+
+#### Results
+
+| Bridge | Peers Before | Peers After |
+|--------|-------------|-------------|
+| Beta (NJ) | 3 | 17-20 |
+| Alpha (Dallas) | 0-2 | 12-18 |
+| Delta (Dallas) | 0-2 | 3-20 |
+| Gamma (Chicago) | 0 | 4 |
+| Epsilon (Atlanta) | 0-4 | 4-20 |
+| Bridge-6 (SV) | 2-3 | 3-5 |
+| Bridge-7 (crawler) | 3-6 | 4-7 |
+
+Novel relay hit rates: Beta 69%, Gamma 52%, Bridge-7 15% (fewer peers = fewer relay opportunities, but still contributing). The bridges went from passive consumers to active participants in the BSV transaction relay network.
+
+### 5.7 BCH Blacklist
+
+During peer discovery, the bridge occasionally connects to Bitcoin Cash (BCH) nodes operating on port 8333. BCH nodes send valid `version` messages but speak an incompatible protocol after the handshake — different block headers, different transaction validation rules, different chain.
+
+The bridge validates inbound `version` messages by checking the user agent string for "Bitcoin SV". Connections from non-BSV nodes are rejected immediately after the `version` exchange. A race condition was discovered where BCH nodes send both `version` and `verack` in the same TCP packet; the buffer processing loop would process the `verack` after the disconnect had been initiated, bypassing the blacklist. Three guards were added to `bsv-peer.js` to handle this: a `destroyed` flag check before processing any message, a disconnect check before processing `verack`, and an explicit `socket.destroy()` call in the rejection path.
+
+### 5.8 DNS Seed Crawler
+
+One of the seven bridges (Bridge-7, Silicon Valley) runs a crawler that probes the BSV peer network. The crawler:
+
+1. Maintains a database of 2,100+ known peer IP addresses gathered from `getaddr` responses across the fleet.
+2. Every 5 minutes, attempts TCP handshakes with all known peers.
+3. Categorises each peer by failure mode: alive, TCP refused, no version message, handshake dropped, wrong protocol (not BSV), connection error.
+4. Publishes verified-alive peers to the DNS seed at `seed.indelible.one`.
+
+The first crawler run revealed a critical insight about the BSV network:
+
+```
+26 alive | no_version: 934, refused: 149, no_verack: 149,
+not_bsv: 17, dropped: 10, error: 2
+```
+
+74% of "known" peers were ghosts — IP addresses that used to run BSV nodes years ago and now run something else entirely, or nothing at all. The peer databases inherited from legacy DNS seeds were polluted with dead entries. The crawler is what prunes the ghosts: it distinguishes live soil from dead soil, giving the network its first accurate picture of its own topology.
+
+Other bridges fetch the crawler's verified peer list on startup, supplementing their own discovery mechanisms. This provides a federation-internal bootstrap path that operates independently of all legacy BSV DNS seeds.
+
+### 5.9 Good Peer Persistence
+
+Peers that send valid block headers are promoted to "good peer" status and saved to `good-peers.json` in the bridge's data directory. On restart, good peers are loaded first and connected before any DNS seed resolution or peer exchange.
+
+Good peer status is not permanent. A peer that fails to connect 3 times consecutively is demoted — removed from the good peers map and returned to the general peer pool with standard cooldown timers. The `consecutiveFails` counter resets to 0 when a peer successfully sends valid headers.
+
+This persistence layer means a bridge restart is not a cold start. The bridge remembers which peers were reliable and reconnects to them first, then discovers new peers through the standard four-stage discovery process (Section 5.1).
 
 ---
 
@@ -167,7 +319,7 @@ Headers are requested using the `getheaders` message with a block locator -- a l
 
 Headers are stored in LevelDB with dual indexing: by height (`header:{height}`) and by hash (`height:{hash}`). This permits both sequential traversal and random access by block hash, the latter being essential for Merkle proof verification.
 
-At the time of writing, the header chain spans 939,000+ blocks. Initial synchronisation of this chain on a 1GB VPS requires the `--max-old-space-size=768` Node.js option to avoid out-of-memory conditions during the download of approximately 75MB of header data.
+At the time of writing, the header chain spans 945,000+ blocks. Initial synchronisation of this chain requires the `NODE_OPTIONS='--max-old-space-size=2048'` environment variable to avoid out-of-memory conditions during the download of approximately 75MB of header data. All production bridges run with 2GB heap allocation — the default 512MB is insufficient for bridges maintaining 15+ peer connections, a full header chain, LevelDB indexes, and in-memory caches simultaneously.
 
 ### 6.3 Merkle Proof Verification
 
@@ -288,16 +440,24 @@ The API layer exposes HTTP endpoints for bridge operators and client application
 - `GET /token/:tick` -- Deploy info for a specific BSV-20 token
 - `GET /token/:tick/balance/:scriptHash` -- Token balance for an owner by script hash
 - `GET /apps` -- Health status of applications running on the bridge
+- `GET /discover` -- List all bridges in the mesh with their endpoints and capabilities
+- `GET /api/address/:addr/balance` -- Confirmed and unconfirmed balance for an address
+- `GET /api/address/:addr/history` -- Full transaction history for an address
+- `GET /api/address/:addr/unspent` -- Unspent transaction outputs for an address
+- `GET /api/tx/:txid/hex` -- Raw transaction hex
 - `POST /broadcast` -- Broadcast a raw transaction to the Bitcoin network
+- `POST /api/sessions/index` -- Index Indelible session metadata
+- `GET /api/sessions/:address` -- List sessions for an address
 
 ### 8.2 Operator Dashboard
 
-Each bridge runs a local HTTP server (default port 9333) with a glassmorphism dashboard. The dashboard provides five tabs:
+Each bridge runs a local HTTP server (default port 9333) with a glassmorphism dashboard featuring a 3D mesh topology map powered by Three.js. The dashboard provides six tabs:
 
-- **Overview**: Bridge stats, peer connections, header height, wallet balance
+- **Overview**: Bridge stats, peer connections, header height, wallet balance, 3D network topology
 - **Mempool**: Real-time transaction list with protocol badges and decoded data
 - **Tx Explorer**: Transaction lookup with full protocol parsing
 - **Inscriptions**: Browser for on-chain inscriptions with mime type and address filtering
+- **Tokens**: BSV-20 token list, deploy info, balance queries
 - **Apps**: Health checks, SSL status, and latency monitoring for applications running on the bridge
 
 Operator access is authenticated via a per-bridge `statusSecret` generated during initialisation.
@@ -369,10 +529,18 @@ A process-level `unhandledRejection` handler provides a safety net for any unfor
 
 When a bridge restarts, it re-establishes all layers:
 
-1. **P2P reconnection**: Re-establishes TCP connections to Bitcoin full nodes via peer discovery.
-2. **Header chain re-synchronisation**: Requests headers from its last known height using `getheaders` with a block locator.
-3. **Federation re-peering**: Reconnects to seed peers, resumes gossip announcements, and re-establishes authenticated WebSocket connections.
-4. **Peer scoring reset**: Peers receive a default stake age on reconnection; scoring resumes with fresh uptime and latency measurements.
+1. **Good peer warm start**: Loads `good-peers.json` (Section 5.9) and connects to peers that proved reliable in the previous session.
+2. **P2P reconnection**: Re-establishes TCP connections to BSV full nodes via the four-stage discovery process (Section 5.1).
+3. **Header chain re-synchronisation**: Requests headers from its last known height using `getheaders` with a block locator.
+4. **Federation re-peering**: Reconnects to seed peers, resumes gossip announcements, and re-establishes authenticated WebSocket connections.
+5. **Beacon backfill**: Scans the on-chain beacon address for any bridges that registered while this bridge was offline.
+6. **Peer scoring reset**: Peers receive a default stake age on reconnection; scoring resumes with fresh uptime and latency measurements.
+
+### 9.4 Process Supervision with systemd
+
+All production bridges are managed by `systemd` — the Linux process supervisor. The bridge registers as a service with `StandardOutput=journal` and `StandardError=journal`, ensuring all logs are captured in the systemd journal for debugging and audit. If the bridge process crashes, `systemd` restarts it automatically, and the recovery sequence described above rebuilds all layers.
+
+This makes the "rejoin the network at will" principle (Section 1) fully automatic. A bridge crash is a temporary absence, not a permanent failure — the network heals around the gap and the bridge resumes when the process restarts.
 
 ---
 
@@ -431,23 +599,30 @@ Gossip announcements include a deduplication mechanism: each announcement is ide
 
 As noted in Section 2.3, sending a `filterload` message to a BSV full node results in an immediate Misbehaving score of 100. The system avoids this entirely by never using bloom filters. All transaction lookups use direct `getdata MSG_TX` with explicit transaction identifiers.
 
-### 11.5 Protocol Compliance
+### 11.5 Protocol Compliance — The 10 Rules
 
-The system maintains strict compliance with the Bitcoin P2P protocol:
+The following table documents every protocol behaviour that BSV full nodes enforce on peers, derived from reading the BSV node source code (C++, `bitcoin-sv-1.1.1`) alongside the bridge code (JavaScript). Violating any rule results in disconnection, deprioritisation, or banning. The federation implements all ten.
 
-- Protocol version 70016 with `protoconf` message after handshake.
-- User agent string matching known BSV client patterns.
-- Proper `version`/`verack` handshake sequence.
-- Correct checksum validation (double-SHA256) on all messages.
-- Proper `pong` responses to `ping` messages.
-- Silent handling of `authch` messages from mining nodes.
-- Relay flag set to 0 (SPV client does not relay).
+| # | BSV Node Requirement | Enforcement Mechanism | Federation Implementation |
+|---|---------------------|----------------------|---------------------------|
+| 1 | `inv`/`getdata`/`tx` three-step handshake (Section 2.2) | Unsolicited `tx` messages are silently ignored by `ProcessMessage()` in `net_processing.cpp`. The transaction never enters the mempool. | `bsv-node-client.js` — broadcasts always send `inv` first, serve `tx` only on `getdata` response. |
+| 2 | `services=0n` — do not claim NODE_NETWORK (Section 4.1.1) | Claiming `services=1n` (NODE_NETWORK) causes full nodes to send `getdata MSG_BLOCK`. Inability to serve blocks triggers misbehaving penalties. | `bsv-peer.js` — version message sets `services=0n` (NODE_NONE). |
+| 3 | No bloom filters (Section 2.3) | `filterload` triggers `Misbehaving(peer, 100)` in `ProcessMessage()` → immediate 24-hour ban. `DEFAULT_PEERBLOOMFILTERS=false` on BSV. | Never sent. All tx lookups use direct `getdata MSG_TX` with explicit txids. |
+| 4 | Current block height in version message (Section 5.6, Fix 1) | Full nodes compare the peer's advertised height against their own chain tip. Stale height → deprioritised as inactive node. | Headers sync to chain tip before connecting to remaining peers. Real height advertised. |
+| 5 | Novel tx relay — first relayer wins (Section 5.4, 5.6) | `nLastTXTime` in `CNodeState` only updates when a peer delivers a tx the node has never seen. Layer 3 of eviction protects the 4 peers with most recent `nLastTXTime`. No novel relay = zero eviction protection. | Immediate `inv` forwarding, shared `_txCache`, mesh→P2P relay. 52-69% hit rates. |
+| 6 | Don't reconnect aggressively (Section 5.6, Fix 4) | `GetChance()` in `addrman.cpp` applies 99% penalty for retries within 10 minutes. `IsTerrible()` marks peers "terrible" after 3 failures. Exponential 0.66x backoff per failure. | 120-second cooldown, concurrency guard, max 20 connections/cycle, 3-fail demotion from good peers. |
+| 7 | Respond to pings | Full nodes send `ping` with a 64-bit nonce. Missing `pong` response → connection scored as unresponsive and eligible for eviction. | `bsv-peer.js` — automatic `pong` with matching nonce on every `ping` received. |
+| 8 | Send `protoconf` after handshake (Section 4.2) | Protocol version 70016+ requires `protoconf` declaring maximum receive payload size. Missing `protoconf` may cause failures on large messages. | Sent immediately after `verack` — advertises 2MB max receive payload. |
+| 9 | Handle `authch` silently (Section 4.2) | Mining nodes send `authch` (authentication challenge) for MinerID. Crashing or disconnecting on unrecognised messages marks the peer as unreliable. | Logged and ignored. Non-mining SPV clients have no MinerID key. Connection proceeds normally. |
+| 10 | `relay=0` in version message | SPV clients that set `relay=1` may receive bloom-filtered data or be expected to relay blocks. Incorrect relay flag creates protocol expectation mismatch. | Version message sets `relay=0`. Selective relay through explicit `inv` forwarding, not the bloom filter path. |
+
+These rules are not suggestions — they are enforced by the BSV node source code. The bridge implements all ten, which is why peer connections persist for hours instead of minutes.
 
 ### 11.6 Stake Bond Anti-Sybil
 
 Registering a bridge requires locking a minimum of 1,000,000 satoshis in a stake bond. This economic cost prevents trivial mass registration of fake bridges. The stake bond transaction ID is included in the on-chain registration payload, making it publicly verifiable.
 
-Stake age is factored into peer scoring (Section 11.8): longer-held stakes contribute to a higher trust score. This creates an ongoing cost for maintaining fake identities -- the attacker's capital remains locked for the duration.
+Stake age is factored into peer scoring (Section 11.7): longer-held stakes contribute to a higher trust score. This creates an ongoing cost for maintaining fake identities -- the attacker's capital remains locked for the duration.
 
 ### 11.7 Peer Scoring
 
@@ -677,28 +852,86 @@ This boundary ensures that the data relay layer remains lightweight, focused, an
 
 ---
 
-## 15. Performance
+## 15. x402 Payment Middleware
 
-### 15.1 Production Deployment
+The relay mesh provides free read access to all API endpoints by default. Bridge operators can optionally enable HTTP 402-based micropayments to earn satoshis from write operations, creating an economic incentive to run infrastructure.
 
-The initial deployment comprises two federation bridge nodes:
+### 15.1 Design: Free Reads, Paid Writes
 
-| Node | Location | RAM | BSV Peers | Header Height | Peer Score |
-|------|----------|-----|-----------|---------------|------------|
-| bridge-alpha | Dallas | 1GB | 230-267 | 939,901 | 0.92 |
-| bridge-beta | New Jersey | 1GB | 230-267 | 939,901 | 0.92 |
+The payment model follows a simple principle: reading data costs nothing, writing data costs satoshis. Transaction lookups, UTXO queries, balance checks, header verification, and mempool inspection are free. Transaction broadcast, session indexing, and data envelope injection can be priced per-endpoint.
 
-Both bridges are registered on-chain on mesh `70016` with 1,000,000-satoshi stake bonds. The on-chain registry enables additional bridges to join the mesh without coordination -- register, stake, connect.
+This asymmetry is deliberate. Free reads attract application developers — the barrier to building on the federation is zero. Paid writes generate revenue for bridge operators — the incentive to run bridges grows with usage. The two-sided flywheel: more apps create more write traffic, more write revenue incentivises more bridges, more bridges improve redundancy and latency for apps.
 
-### 15.2 Broadcast Performance
+### 15.2 Protocol
 
-Transaction broadcasts reach 250+ Bitcoin full nodes simultaneously via the P2P layer, covering the vast majority of the reachable BSV network. Inter-bridge relay via WebSocket adds sub-second mesh-wide propagation.
+When a client sends a request to a paid endpoint without payment, the bridge responds with HTTP 402 (Payment Required) and a JSON body specifying the price in satoshis and the bridge operator's BSV address. The client constructs a BSV transaction paying the specified amount, broadcasts it, and retries the original request with the transaction ID in the `X-Payment-TxId` header.
 
-### 15.3 Header Synchronisation
+The bridge verifies the payment transaction exists in the mempool (checking both its own mempool and the P2P network), confirms the output pays the correct address for the correct amount, and processes the original request.
 
-Initial synchronisation of the full 939,000+ block header chain takes approximately 15-30 minutes. Subsequent synchronisation completes in under one second per new block.
+### 15.3 Replay Protection
 
-### 15.4 Federation Overhead
+Each payment transaction ID is recorded in a single-key LevelDB entry (`u!{txid}`). A transaction ID that has already been used is rejected. This prevents replay attacks where a single payment is reused for multiple requests.
+
+### 15.4 Configuration
+
+```json
+{
+  "x402": {
+    "enabled": true,
+    "payTo": "1OperatorAddress...",
+    "endpoints": {
+      "POST /api/broadcast": 1000
+    }
+  }
+}
+```
+
+Operators set prices per-endpoint in satoshis. Endpoints not listed in the `endpoints` map remain free. The entire x402 layer is disabled by default — a bridge with no `x402` configuration serves all endpoints for free.
+
+### 15.5 Compatibility
+
+The implementation follows the [x402 protocol](https://www.x402.org/) specification used by Coinbase and Cloudflare on Ethereum/Base/Solana, adapted for BSV. The same HTTP 402 flow applies — the difference is that payment is verified on-chain via BSV transaction rather than an EVM smart contract. This positions federation bridges as participants in the broader x402 ecosystem, which has processed 75M+ transactions across multiple chains.
+
+### 15.6 Operator Dashboard
+
+The bridge dashboard includes an x402 tab showing:
+
+- Total revenue earned (satoshis and USD equivalent)
+- Per-endpoint pricing table
+- Payment receipt log with transaction IDs
+- Operator configuration controls
+
+---
+
+## 16. Performance
+
+### 16.1 Production Deployment
+
+The deployment comprises seven federation bridge nodes across six geographic locations:
+
+| Node | Location | RAM | BSV Peers | Novel Relay | Uptime |
+|------|----------|-----|-----------|-------------|--------|
+| bridge-alpha | Dallas, TX | 2GB | 12-18 | 52% hit rate | systemd managed |
+| bridge-beta | New Jersey | 2GB | 17-20 | 69% hit rate | systemd managed |
+| bridge-gamma | Chicago, IL | 2GB | 4-6 | 52% hit rate | systemd managed |
+| bridge-delta | Dallas, TX | 2GB | 3-20 | moderate | systemd managed |
+| bridge-epsilon | Atlanta, GA | 2GB | 4-20 | moderate | systemd managed |
+| bridge-6 | Silicon Valley | 2GB | 3-5 | active | systemd managed |
+| bridge-7 | Silicon Valley | 2GB | 4-7 | 15% (crawler node) | systemd managed |
+
+All bridges are registered on-chain on mesh `70016` with 1,000,000-satoshi stake bonds. All run with `NODE_OPTIONS='--max-old-space-size=2048'` to prevent out-of-memory crashes during extended operation — the default 512MB Node.js heap is insufficient for bridges maintaining 15+ peer connections, a full header chain, and LevelDB indexes simultaneously. All are managed by `systemd` with journal logging for crash recovery and audit.
+
+Bridge-7 additionally runs the DNS seed crawler (Section 5.8), probing 2,100+ known peers and publishing verified-alive peers to `seed.indelible.one`.
+
+### 16.2 Broadcast Performance
+
+Transaction broadcasts reach 15-20 Bitcoin full nodes per bridge via the P2P layer. With novel transaction relay (Section 5.6), bridges achieve 52-69% hit rates — meaning over half of relayed transactions are novel to the receiving BSV node. Inter-bridge relay via WebSocket adds sub-second mesh-wide propagation, and mesh-to-P2P relay ensures federation transactions reach the BSV network through all seven bridges simultaneously.
+
+### 16.3 Header Synchronisation
+
+Initial synchronisation of the full 945,000+ block header chain takes approximately 15-30 minutes. Subsequent synchronisation completes in under one second per new block. The `--max-old-space-size=2048` option is required during initial sync to accommodate the ~75MB header dataset in memory.
+
+### 16.4 Federation Overhead
 
 | Operation | Cost |
 |-----------|------|
@@ -710,71 +943,99 @@ Initial synchronisation of the full 939,000+ block header chain takes approximat
 
 ---
 
-## 16. Related Work
+## 17. Related Work
 
-### 16.1 The Bitcoin Whitepaper
+### 17.1 The Bitcoin Whitepaper
 
-This system is a direct implementation of the principles described by Nakamoto [1]. Section 8 provides the theoretical foundation for SPV. Section 5 defines the broadcast protocol. Section 7 describes the Merkle tree structure. Section 2 establishes the transaction model. Section 12 [1] establishes crash tolerance.
+This system is a direct implementation of the principles described by Nakamoto [1]. Section 8 of the whitepaper provides the theoretical foundation for SPV. Section 5 defines the broadcast protocol. Section 7 describes the Merkle tree structure. Section 2 establishes the transaction model. The whitepaper establishes crash tolerance: "Nodes can leave and rejoin the network at will."
 
-### 16.2 Overlay Network Architectures
+### 17.2 Overlay Network Architectures
 
 Wright [3] describes overlay networks built atop the Bitcoin peer-to-peer layer, with attention to structured routing (Pastry DHT), reputation scoring, and eclipse attack resistance. The federation layer described in this paper implements several of the mechanisms Wright described: reputation scoring (peer scorer), node admission (on-chain registry with stake bonds), and cryptographic identity verification (handshake protocol).
 
-### 16.3 Electrum and Similar SPV Systems
+### 17.3 Electrum and Similar SPV Systems
 
 Electrum-style SPV systems use a client-server model where dedicated indexing servers serve SPV clients over a custom protocol. While effective, this model introduces a trusted third party. The relay mesh eliminates this dependency -- bridges connect directly to Bitcoin full nodes and maintain their own header chains.
 
-### 16.4 Centralised Node Providers
+### 17.4 Centralised Node Providers
 
 Ethereum has Infura and Alchemy. Solana has Helius and QuickNode. These services provide API access to blockchain networks without running a full node. They solve the same problem the relay mesh solves -- but through centralisation. One company controls access, pricing, and uptime. The relay mesh achieves the same convenience with decentralised infrastructure. Every developer runs their own bridge.
 
 ---
 
-## 17. Future Work
+## 18. Future Work
 
-### 17.1 Merkle Tree Pruning
+### 18.1 Merkle Tree Pruning
 
 Section 7 of the Bitcoin whitepaper [1] describes reclaiming disk space through Merkle tree pruning. Implementing this would allow long-running bridges to discard old transaction data while retaining verification capability.
 
-### 17.2 Advanced UTXO Management
+### 18.2 Advanced UTXO Management
 
 Pre-splitting UTXOs into parallel chains would enable concurrent broadcast operations without contention, relevant for high-throughput applications.
 
-### 17.3 Pastry DHT Routing
+### 18.3 Pastry DHT Routing
 
 Replacing the current gossip-based discovery with DHT-based routing would reduce the O(n) message cost of announcement flooding to O(log n), enabling the mesh to scale to hundreds of bridges.
 
-### 17.4 Process Supervision
-
-Integration with `systemd` would provide automatic restart on crash, making the "rejoin the network at will" principle fully automatic.
-
-### 17.5 Cross-Mesh Isolation
+### 18.4 Cross-Mesh Isolation
 
 The `mesh_id` field in the registration schema supports multiple independent meshes. Cross-mesh peering policies and routing are deferred until demand materialises.
 
-### 17.6 Index Service
+### 18.5 Index Service
 
 When the number of registered bridges exceeds ~50, chain scanning for registry transactions may become slow. An optional index service could cache registry state for faster bootstrap.
 
-### 17.7 BSV-20 Transfer Tracking
+### 18.6 BSV-20 Transfer Tracking
 
 The current token indexing supports deploy and mint operations. Transfer tracking -- following token ownership as inscriptions move between outputs -- requires building a UTXO graph for ordinal positions. This is deferred to a future phase.
 
-### 17.8 Full Block Fetching
+### 18.7 Full Block Fetching
 
 Historical backfill currently relies on WhatsOnChain for block transaction lists. Adding `MSG_BLOCK` support behind a feature flag would enable fully self-sovereign backfill with no third-party dependency, at the cost of increased bandwidth and storage.
 
+### 18.8 Rate Limiting and DDoS Protection
+
+Per-IP rate limiting for unauthenticated API requests. Currently described in the security section but not implemented as a configurable module.
+
 ---
 
-## 18. Conclusion
+## 19. The Wood Wide Web
 
-The federated SPV relay mesh transforms isolated SPV nodes into an open, self-governing network. Any BSV developer can run a bridge, register on-chain, and join the mesh -- no permission required, no central authority, no API keys. The protocol uses BSV at every layer: identity (one keypair per bridge), registry (CBOR-encoded OP_RETURN transactions), security (stake bonds locked to the operator's own address), discovery (beacon address scanning and gossip), and trust (local peer scoring based on observed behaviour).
+In the 1990s, forest ecologist Suzanne Simard discovered that trees are not individuals competing for resources. They are nodes in a network. Underground, fungal threads called mycelium connect every tree in the forest — routing nitrogen from alders to firs, sending sugar from old trees to seedlings, self-healing when threads are severed. Scientists call it the Wood Wide Web. It has been evolving for 1.5 billion years.
 
-The system is deployed in production with two geographically distributed bridges serving the Indelible platform as a reference implementation. 383 tests verify the protocol implementation. The npm packages are published and install with a single command.
+The parallels to the federation are not metaphorical convenience. They are structural convergence — the same engineering constraints produce the same architecture:
 
-BSV has the technical capability -- big blocks, cheap fees, native OP_RETURN, powerful script. What it has lacked is developer infrastructure. The relay mesh fills the gap between "run a full node" and "depend on someone else's API."
+| Forest | Federation |
+|--------|-----------|
+| Mycelium threads | Bridges |
+| Trees | Applications |
+| Nutrients (nitrogen, sugar) | Transactions |
+| Spore dispersal | DNS seed crawler |
+| Mycorrhizal network (root-fungus interface) | REST API (app-bridge interface) |
+| Fruiting bodies (mushrooms) | On-chain registry (visible discovery surface) |
+| Soil taste (nutrient sensing) | Crawler bucket analysis (network health sensing) |
 
-The code is not theoretical. It is deployed, running, and processing real transactions on the Bitcoin SV mainnet.
+No central hub — cut down the oldest tree, the network survives. Self-healing — sever one thread, nutrients reroute through others. Plug-and-play — new trees tap into existing infrastructure without building their own root system. Emergent cooperation without central control — the forest "decides" where resources go without a master controller.
+
+The metaphor completed itself in April 2026. The legacy BSV DNS seeds — the spore banks of the ecosystem — went dark. Two domains stopped existing. Two more returned empty responses. The federation had been passively depending on external seed infrastructure. Like a forest island cut off from continental spore flow, the network risked slow atrophy as peers disconnected and no replacements arrived.
+
+The response was to build the federation's reproductive system: a crawler that probes the BSV network every five minutes, tagging peers by failure mode, learning what's alive and what's ghost. A DNS seed at `seed.indelible.one` publishing verified-alive peers. Good peer persistence saving reliable peers to disk. The federation stopped depending on anything it could not replace.
+
+The first crawler run revealed that 74% of "known" BSV peers were ghosts — IP addresses that used to run BSV nodes and now run something else entirely. The BSV network's self-image was polluted with the corpses of an older network. The crawler prunes the ghosts. It is how the mycelium forgets dead soil and remembers live soil.
+
+Forests that survive a billion years are the ones that finish growing into themselves. They do not depend on anything they cannot replace.
+
+---
+
+## 20. Conclusion
+
+The Indelible Federation transforms isolated SPV nodes into an open, self-governing network — a Wood Wide Web for Bitcoin. Any developer can run a bridge, register on-chain, and join the mesh — no permission required, no central authority, no API keys. The protocol uses BSV at every layer: identity (one keypair per bridge), registry (CBOR-encoded OP_RETURN transactions), security (stake bonds locked to the operator's own address), discovery (beacon address scanning, gossip, DNS seed crawler, and good peer persistence), trust (local peer scoring based on observed behaviour), and revenue (x402 micropayments for bridge operators).
+
+Seven bridges operate across six geographic locations, managed by systemd, syncing 945,000+ block headers, relaying transactions with 52-69% novel relay hit rates, and serving three production applications. 422 tests verify the protocol implementation. The npm packages install with a single command.
+
+The system is self-contained. It runs its own DNS seed. It runs its own crawler. It persists its own good peers. It discovers bridges through its own on-chain registry. No external dependency — no DNS seed, no API, no third-party service — can take this network down. Every bridge that joins makes the mesh stronger. Every application that connects creates demand for more bridges. Every bridge operator that earns x402 revenue has an incentive to keep their infrastructure running.
+
+BSV has the technical capability — big blocks, cheap fees, native OP_RETURN, powerful script. What it has lacked is developer infrastructure. The federation fills the gap between "run a full node" and "depend on someone else's API." The mycelium is live. Just tap in.
 
 ---
 
@@ -794,6 +1055,6 @@ The code is not theoretical. It is deployed, running, and processing real transa
 
 ---
 
-*Relay Federation -- Open BSV infrastructure, secured by proof of work.*
+*Indelible Federation — The Wood Wide Web for Bitcoin. Open infrastructure, secured by proof of work.*
 
 *https://github.com/zcoolz/relay-federation*

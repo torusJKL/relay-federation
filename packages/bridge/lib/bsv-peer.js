@@ -134,6 +134,8 @@ export class BSVPeer extends EventEmitter {
     this._destroyed = false
     this._host = null
     this._port = null
+    this._inbound = false
+    this._versionSent = false
 
     this._syncTimer = null
     this._pingTimer = null
@@ -165,6 +167,61 @@ export class BSVPeer extends EventEmitter {
     // Transaction tracking
     this._pendingTxRequests = new Map()
     this._pendingBroadcasts = new Map()
+    this._sharedTxCache = opts.sharedTxCache || null
+  }
+
+  /**
+   * Accept an inbound connection from a remote BSV node.
+   * The remote peer connected to us — we already have the socket.
+   * Protocol: they send version → we send version + verack → they send verack → handshake.
+   *
+   * @param {import('node:net').Socket} socket — already-connected TCP socket
+   * @param {string} host — remote IP
+   * @param {number} [port=8333]
+   * @returns {Promise<{ version, userAgent, startHeight }>}
+   */
+  async acceptInbound (socket, host, port = 8333) {
+    if (this._destroyed) throw new Error('peer destroyed')
+    this._host = host
+    this._port = port
+    this._inbound = true
+    this._socket = socket
+    this._connected = true
+
+    return new Promise((resolve, reject) => {
+      this._socket.on('data', (data) => this._onData(data))
+
+      const onError = (err) => {
+        clearTimeout(timer)
+        this.removeListener('handshake', onHandshake)
+        this._connected = false
+        reject(err)
+      }
+
+      const onHandshake = (info) => {
+        clearTimeout(timer)
+        if (this._socket) this._socket.removeListener('error', onError)
+        if (this._socket) {
+          this._socket.on('error', (err) => {
+            this.emit('error', err)
+          })
+        }
+        resolve(info)
+      }
+
+      const onTimeout = () => {
+        if (this._socket) this._socket.removeListener('error', onError)
+        this.removeListener('handshake', onHandshake)
+        this.disconnect()
+        reject(new Error('Inbound handshake timeout (10s)'))
+      }
+
+      this._socket.once('error', onError)
+      this._socket.on('close', () => this._onDisconnect())
+      this.once('handshake', onHandshake)
+      const timer = setTimeout(onTimeout, 10000)
+      // Don't send version yet — wait for their version first (handled in _onVersion)
+    })
   }
 
   /**
@@ -276,6 +333,34 @@ export class BSVPeer extends EventEmitter {
   }
 
   /**
+   * Advertise our own address to this peer via the addr P2P message.
+   * Peers gossip received addresses to their peers, making us discoverable.
+   * @param {string} ip — our public IPv4 address
+   * @param {number} [port=8333]
+   */
+  sendSelfAddr (ip, port = 8333) {
+    if (!this._handshakeComplete) return
+    // addr message: varint count + (4 timestamp + 8 services + 16 IP + 2 port) per entry
+    const payload = Buffer.alloc(1 + 30)
+    let o = 0
+    payload[o++] = 1 // count = 1
+    const now = Math.floor(Date.now() / 1000)
+    payload.writeUInt32LE(now, o); o += 4
+    payload.writeBigUInt64LE(1n, o); o += 8 // services = NODE_NETWORK
+    // IPv4-mapped IPv6
+    payload.fill(0, o, o + 10); o += 10
+    payload[o++] = 0xff
+    payload[o++] = 0xff
+    const parts = ip.split('.').map(Number)
+    payload[o++] = parts[0]
+    payload[o++] = parts[1]
+    payload[o++] = parts[2]
+    payload[o++] = parts[3]
+    payload.writeUInt16BE(port, o); o += 2
+    this._sendMessage('addr', payload.subarray(0, o))
+  }
+
+  /**
    * Fetch a transaction by txid from this peer.
    * @param {string} txid
    * @param {number} [timeoutMs=10000]
@@ -328,6 +413,19 @@ export class BSVPeer extends EventEmitter {
     this._sendMessage('inv', invPayload)
 
     return txid
+  }
+
+  /**
+   * Relay an inv announcement for a txid we don't have the raw hex for yet.
+   * Used for immediate inv relay — getdata will be served from sharedTxCache.
+   * @param {string} txid — display-format txid
+   */
+  relayInv (txid) {
+    const invPayload = Buffer.alloc(37)
+    invPayload[0] = 1 // count = 1
+    invPayload.writeUInt32LE(1, 1) // MSG_TX = 1
+    hashToInternal(txid).copy(invPayload, 5)
+    this._sendMessage('inv', invPayload)
   }
 
   /**
@@ -524,6 +622,11 @@ export class BSVPeer extends EventEmitter {
     if (!this._peerUserAgent.includes('Bitcoin SV')) {
       this.disconnect()
       return
+    }
+
+    // For inbound connections, send our version now (they initiated)
+    if (this._inbound && !this._versionSent) {
+      this._sendVersion()
     }
 
     this._sendMessage('verack', Buffer.alloc(0))
@@ -754,11 +857,12 @@ export class BSVPeer extends EventEmitter {
 
       if (invType === 1) {
         const txid = internalToHash(hashBuf)
-        const rawHex = this._pendingBroadcasts.get(txid)
+        const rawHex = this._pendingBroadcasts.get(txid) || (this._sharedTxCache && this._sharedTxCache.get(txid))
         if (rawHex) {
           this._sendMessage('tx', Buffer.from(rawHex, 'hex'))
           this._pendingBroadcasts.delete(txid)
           this.emit('tx:broadcast', txid)
+          console.log(`[P2P novel-relay] ${txid.slice(0, 12)}... accepted by peer`)
         }
       }
     }
@@ -782,6 +886,7 @@ export class BSVPeer extends EventEmitter {
   }
 
   _sendVersion () {
+    this._versionSent = true
     const userAgentBuf = Buffer.from(USER_AGENT, 'ascii')
     const payloadSize = 4 + 8 + 8 + 26 + 26 + 8 + 1 + userAgentBuf.length + 4 + 1
     const payload = Buffer.alloc(payloadSize)

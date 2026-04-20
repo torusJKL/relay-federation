@@ -765,7 +765,21 @@ async function cmdStart () {
 
   // ── 6b. BSV P2P header sync — connect to BSV nodes ──────
   const { BSVNodeClient } = await import('./lib/bsv-node-client.js')
-  const bsvNode = new BSVNodeClient()
+
+  // Auto-detect public IP for inbound P2P + addr advertisement
+  let p2pPublicIp = null
+  try {
+    const ipRes = await fetch('https://api.ipify.org?format=json', { signal: AbortSignal.timeout(5000) })
+    if (ipRes.ok) p2pPublicIp = (await ipRes.json()).ip
+  } catch {}
+
+  const bsvNode = new BSVNodeClient({
+    enableInbound: true,
+    listenPort: 8333,
+    publicIp: p2pPublicIp,
+    persistPath: join(dataDir, 'good-peers.json'),
+    crawlerUrl: 'http://66.135.31.144:9333/api/crawler/peers'
+  })
 
   bsvNode.on('headers', async ({ headers, count }) => {
     // Feed into HeaderRelay for peer propagation
@@ -798,14 +812,11 @@ async function cmdStart () {
     }
   })
 
-  // Track txids announced via BSV P2P inv — only request unseen txs
-  bsvNode.on('tx:inv', ({ txids, peer }) => {
-    const unseen = []
+  // Track txids announced via BSV P2P inv (tx fetching handled by bsv-node-client relay)
+  bsvNode.on('tx:inv', ({ txids }) => {
     for (const txid of txids) {
-      if (!txRelay.hasSeen(txid)) unseen.push(txid)
       txRelay.trackTxid(txid)
     }
-    if (unseen.length > 0 && peer) peer.requestTxs(unseen)
   })
 
   // Feed raw txs from BSV P2P into the mesh relay + address watcher
@@ -1041,10 +1052,20 @@ async function cmdStart () {
     statusServer.addLog(msg)
   })
 
-  txRelay.on('tx:new', ({ txid }) => {
+  txRelay.on('tx:new', ({ txid, rawHex }) => {
     const msg = `New tx: ${txid}`
     console.log(msg)
     statusServer.addLog(msg)
+
+    // Fix 3: Relay mesh-received txs to BSV P2P peers.
+    // If this tx came from our own BSV P2P, it's already in _seenTxids — skip.
+    // Only relay txs we learned about from the federation mesh.
+    if (rawHex && !bsvNode._seenTxids.has(txid)) {
+      const relayed = bsvNode.broadcastTx(rawHex)
+      if (relayed) {
+        console.log(`[mesh→P2P] ${txid.slice(0, 12)}... relayed to BSV peers`)
+      }
+    }
   })
 
   dataRelay.on('data:new', ({ topic, pubkeyHex }) => {

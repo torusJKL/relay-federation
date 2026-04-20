@@ -1,5 +1,7 @@
 import { EventEmitter } from 'node:events'
+import { createServer } from 'node:net'
 import { resolve4 } from 'node:dns/promises'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { BSVPeer } from './bsv-peer.js'
 
 /**
@@ -77,13 +79,35 @@ export class BSVNodeClient extends EventEmitter {
 
     // Reconnect backoff: host → { until: timestamp, delay: ms }
     this._peerCooldown = new Map()
-    this._baseCooldownMs = 5000       // 5s initial cooldown
-    this._maxCooldownMs = 300000      // 5 min cap
+    this._baseCooldownMs = 120000      // 2 min initial cooldown (must exceed 60s maintain interval)
+    this._maxCooldownMs = 600000      // 10 min cap
     // Permanent blacklist for non-BSV peers (BCH/BTC) — never reconnect
     this._blacklist = new Set()
 
     // Peers discovered via P2P addr exchange (not just DNS)
     this._addrPool = new Set()
+
+    // Transaction relay — dedup set to prevent relay loops
+    this._seenTxids = new Set()
+
+    // Shared tx cache for immediate inv relay (Fix 2)
+    // When we relay inv before having rawHex, the tx arrives later and goes here.
+    // Any peer's getdata handler checks this cache.
+    this._txCache = new Map()
+    this._txCacheMax = 500
+
+    // Persist good peers across restarts
+    this._goodPeers = new Map() // host → { port, lastSeen }
+    this._persistPath = opts.persistPath || null
+
+    // Crawler URL — fetch verified alive peers from federation crawler
+    this._crawlerUrl = opts.crawlerUrl || null
+
+    // Inbound listener
+    this._server = null
+    this._listenPort = opts.listenPort || 8333
+    this._enableInbound = opts.enableInbound ?? false
+    this._publicIp = opts.publicIp || null // our IP for addr self-advertisement
 
     // Track best height across all peers
     this._bestHeight = this._checkpoint.height
@@ -108,6 +132,11 @@ export class BSVNodeClient extends EventEmitter {
   async connect () {
     if (this._destroyed) return
 
+    // Load persisted good peers first — these get priority
+    this._loadGoodPeers()
+    const goodPeerList = [...this._goodPeers.entries()]
+    const goodAddrs = goodPeerList.map(([host, info]) => ({ host, port: info.port || 8333 }))
+
     const addresses = await this._discoverPeers()
 
     // Shuffle for load distribution
@@ -116,14 +145,50 @@ export class BSVNodeClient extends EventEmitter {
       [addresses[i], addresses[j]] = [addresses[j], addresses[i]]
     }
 
-    // Connect to all discovered peers
-    for (const addr of addresses) {
-      this._connectToPeer(addr.host, addr.port)
+    // Filter out already-connected
+    const dnsAddrs = addresses.filter(a => !goodAddrs.some(g => g.host === a.host))
+
+    // Fix 1: Connect to 1 peer first, sync headers to chain tip, then connect to the rest.
+    // Without this, our version message advertises checkpoint height (930,000) to every peer,
+    // making us look 15,000+ blocks behind. BSV nodes throttle tx relay to unsynced peers.
+    const allAddrs = [...goodAddrs, ...dnsAddrs]
+    if (allAddrs.length > 0) {
+      const [first, ...rest] = allAddrs
+      console.log(`[P2P] Syncing headers from ${first.host} before connecting to pack...`)
+      this._connectToPeer(first.host, first.port)
+
+      // Wait for handshake + header sync (up to 60s)
+      try {
+        const peerStartHeight = await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('timeout')), 15000)
+          this.once('handshake', ({ startHeight }) => {
+            clearTimeout(timer)
+            resolve(startHeight)
+          })
+        })
+        await this.waitForSync(peerStartHeight, 45000)
+        console.log(`[P2P] Headers synced to ${this._bestHeight} — connecting to pack`)
+      } catch (err) {
+        console.log(`[P2P] Header sync skipped (${err.message}) — connecting anyway at height ${this._bestHeight}`)
+      }
+
+      // Now connect to the rest — version messages will have correct height
+      const remaining = rest.filter(a => !this._peers.has(a.host))
+      await this._staggerConnect(remaining, 'pack')
     }
 
     // Start maintenance timer
     this._maintainTimer = setInterval(() => this._maintainPeers(), MAINTAIN_INTERVAL_MS)
     if (this._maintainTimer.unref) this._maintainTimer.unref()
+
+    // Clear seen txids periodically (prevent unbounded memory growth)
+    this._seenTxidTimer = setInterval(() => this._seenTxids.clear(), 120000)
+    if (this._seenTxidTimer.unref) this._seenTxidTimer.unref()
+
+    // Start inbound listener if enabled
+    if (this._enableInbound) {
+      this.startListening()
+    }
   }
 
   /**
@@ -132,10 +197,151 @@ export class BSVNodeClient extends EventEmitter {
   disconnect () {
     this._destroyed = true
     clearInterval(this._maintainTimer)
+    clearInterval(this._seenTxidTimer)
+    if (this._server) {
+      this._server.close()
+      this._server = null
+    }
     for (const peer of this._peers.values()) {
       peer.disconnect()
     }
     this._peers.clear()
+  }
+
+  /**
+   * Start listening for inbound P2P connections.
+   * Other BSV nodes can connect to us, increasing peer count significantly.
+   * @param {number} [port=8333]
+   */
+  startListening (port) {
+    const listenPort = port || this._listenPort
+    this._server = createServer((socket) => {
+      const host = socket.remoteAddress?.replace('::ffff:', '') || 'unknown'
+      if (this._blacklist.has(host) || this._peers.has(host)) {
+        socket.destroy()
+        return
+      }
+      // Cap total peers (inbound + outbound)
+      if (this._peers.size >= 32) {
+        socket.destroy()
+        return
+      }
+
+      this._acceptInboundPeer(socket, host)
+    })
+
+    this._server.on('error', (err) => {
+      if (err.code === 'EADDRINUSE') {
+        console.error(`[P2P] Port ${listenPort} already in use — inbound disabled`)
+      } else {
+        console.error(`[P2P] Listen error:`, err.message)
+      }
+    })
+
+    this._server.listen(listenPort, '0.0.0.0', () => {
+      console.log(`[P2P] Listening for inbound connections on port ${listenPort}`)
+    })
+  }
+
+  /**
+   * Accept an inbound peer connection. Same event wiring as outbound.
+   * @param {import('node:net').Socket} socket
+   * @param {string} host
+   */
+  async _acceptInboundPeer (socket, host) {
+    const peer = new BSVPeer({
+      checkpoint: this._checkpoint,
+      syncIntervalMs: this._syncIntervalMs,
+      pingIntervalMs: this._pingIntervalMs,
+      headerHashes: this._sharedHeaderHashes,
+      hashToHeight: this._sharedHashToHeight,
+      sharedTxCache: this._txCache
+    })
+
+    this._peers.set(host, peer)
+
+    // Wire events — same as outbound
+    peer.on('headers', (data) => {
+      for (const h of data.headers) {
+        if (h.height > this._bestHeight) {
+          this._bestHeight = h.height
+          this._bestHash = h.hash
+        }
+      }
+      this._clearCooldown(host)
+      if (!this._goodPeers.has(host)) {
+        console.log(`[P2P good-peer] ${host} marked good (sent headers)`)
+      }
+      this._goodPeers.set(host, { port: peer._port || 8333, lastSeen: Date.now(), consecutiveFails: 0 })
+      this.emit('headers', data)
+    })
+
+    peer.on('connected', (data) => this.emit('connected', data))
+    peer.on('handshake', (data) => {
+      this.emit('handshake', data)
+      peer.requestAddr()
+      // Advertise our own address so peers gossip us across the network
+      if (this._publicIp) {
+        peer.sendSelfAddr(this._publicIp, this._listenPort)
+      }
+    })
+
+    peer.on('addr', ({ addrs }) => {
+      for (const a of addrs) {
+        if (!this._peers.has(a.host) && !this._blacklist.has(a.host)) {
+          this._addrPool.add(`${a.host}:${a.port}`)
+          this._connectToPeer(a.host, a.port)
+        }
+      }
+    })
+
+    peer.on('disconnected', (data) => {
+      const wasBch = !peer._handshakeComplete && peer._peerUserAgent && !peer._peerUserAgent.includes('Bitcoin SV')
+      this._peers.delete(host)
+      if (wasBch) {
+        this._blacklist.add(host)
+      }
+      this.emit('disconnected', data)
+    })
+
+    peer.on('error', (err) => this.emit('error', err))
+
+    peer.on('tx', (data) => {
+      this.emit('tx', data)
+      // Store in shared cache for getdata from relayed-inv peers
+      if (this._txCache.size >= this._txCacheMax) {
+        const oldest = this._txCache.keys().next().value
+        this._txCache.delete(oldest)
+      }
+      this._txCache.set(data.txid, data.rawHex)
+    })
+
+    peer.on('tx:inv', ({ txids, peer: sourcePeer }) => {
+      this.emit('tx:inv', { txids, peer: sourcePeer })
+      const newTxids = txids.filter(t => !this._seenTxids.has(t))
+      for (const t of newTxids) this._seenTxids.add(t)
+      if (newTxids.length > 0 && peer._handshakeComplete) {
+        // Fix 2: immediate inv relay (same as outbound handler)
+        let relayCount = 0
+        for (const [h, p] of this._peers) {
+          if (p !== peer && p._handshakeComplete) {
+            for (const t of newTxids) p.relayInv(t)
+            relayCount++
+          }
+        }
+        if (relayCount > 0) {
+          console.log(`[P2P relay] ${newTxids.length} inv → ${relayCount} peers (immediate)`)
+        }
+        peer.requestTxs(newTxids)
+      }
+    })
+
+    try {
+      await peer.acceptInbound(socket, host)
+      console.log(`[P2P] Inbound peer ${host} connected (${this._peers.size} total)`)
+    } catch {
+      this._peers.delete(host)
+    }
   }
 
   /**
@@ -319,7 +525,8 @@ export class BSVNodeClient extends EventEmitter {
         connected: peer._connected,
         handshake: peer._handshakeComplete,
         bestHeight: peer._bestHeight,
-        userAgent: peer._peerUserAgent
+        userAgent: peer._peerUserAgent,
+        inbound: !!peer._inbound
       })
     }
     return list
@@ -357,6 +564,26 @@ export class BSVNodeClient extends EventEmitter {
       }
     }
 
+    // Fetch verified alive peers from federation crawler
+    if (this._crawlerUrl) {
+      try {
+        const res = await fetch(this._crawlerUrl, { signal: AbortSignal.timeout(5000) })
+        const data = await res.json()
+        const crawlerPeers = data.peers || data
+        for (const p of crawlerPeers) {
+          if (p.host && !seen.has(p.host)) {
+            seen.add(p.host)
+            peers.push({ host: p.host, port: p.port || this._port })
+          }
+        }
+        if (crawlerPeers.length > 0) {
+          console.log(`[P2P] Fetched ${crawlerPeers.length} peers from crawler`)
+        }
+      } catch {
+        // Crawler unavailable — continue with DNS + fallback
+      }
+    }
+
     return peers
   }
 
@@ -364,8 +591,17 @@ export class BSVNodeClient extends EventEmitter {
 
   /**
    * Check if a host is in cooldown. Returns true if we should skip connecting.
+   * Good peers use normal cooldown — they only get priority ordering, not bypass.
    */
   _isInCooldown (host) {
+    // Demote good peers after 3 consecutive failures
+    if (this._goodPeers.has(host)) {
+      const gp = this._goodPeers.get(host)
+      if ((gp.consecutiveFails || 0) >= 3) {
+        console.log(`[P2P demote] ${host} dropped from good-peers (${gp.consecutiveFails} consecutive fails)`)
+        this._goodPeers.delete(host)
+      }
+    }
     const entry = this._peerCooldown.get(host)
     if (!entry) return false
     if (Date.now() < entry.until) return true
@@ -408,7 +644,8 @@ export class BSVNodeClient extends EventEmitter {
       syncIntervalMs: this._syncIntervalMs,
       pingIntervalMs: this._pingIntervalMs,
       headerHashes: this._sharedHeaderHashes,
-      hashToHeight: this._sharedHashToHeight
+      hashToHeight: this._sharedHashToHeight,
+      sharedTxCache: this._txCache
     })
 
     this._peers.set(host, peer)
@@ -422,8 +659,12 @@ export class BSVNodeClient extends EventEmitter {
           this._bestHash = h.hash
         }
       }
-      // Stable peer — clear its cooldown
+      // Stable peer — clear its cooldown and mark as good
       this._clearCooldown(host)
+      if (!this._goodPeers.has(host)) {
+        console.log(`[P2P good-peer] ${host} marked good (sent headers)`)
+      }
+      this._goodPeers.set(host, { port: peer._port || 8333, lastSeen: Date.now(), consecutiveFails: 0 })
       this.emit('headers', data)
     })
 
@@ -434,6 +675,10 @@ export class BSVNodeClient extends EventEmitter {
       this.emit('handshake', data)
       // Ask this peer for its known peers
       peer.requestAddr()
+      // Advertise our own address so we become discoverable
+      if (this._publicIp) {
+        peer.sendSelfAddr(this._publicIp, this._listenPort)
+      }
     })
 
     // Discover new peers through P2P addr exchange
@@ -454,6 +699,11 @@ export class BSVNodeClient extends EventEmitter {
         // BCH/BTC node — permanent blacklist, never reconnect
         this._blacklist.add(host)
       } else {
+        // Track consecutive failures for good peers
+        if (this._goodPeers.has(host)) {
+          const gp = this._goodPeers.get(host)
+          gp.consecutiveFails = (gp.consecutiveFails || 0) + 1
+        }
         // Normal disconnect — exponential backoff
         this._applyCooldown(host)
       }
@@ -465,8 +715,38 @@ export class BSVNodeClient extends EventEmitter {
       this.emit('error', err)
     })
 
-    peer.on('tx', (data) => this.emit('tx', data))
-    peer.on('tx:inv', (data) => this.emit('tx:inv', data))
+    peer.on('tx', (data) => {
+      this.emit('tx', data)
+      // Store in shared cache — getdata from relayed-inv peers will find it here
+      if (this._txCache.size >= this._txCacheMax) {
+        const oldest = this._txCache.keys().next().value
+        this._txCache.delete(oldest)
+      }
+      this._txCache.set(data.txid, data.rawHex)
+    })
+
+    peer.on('tx:inv', ({ txids, peer: sourcePeer }) => {
+      this.emit('tx:inv', { txids, peer: sourcePeer })
+      const newTxids = txids.filter(t => !this._seenTxids.has(t))
+      for (const t of newTxids) this._seenTxids.add(t)
+      if (newTxids.length > 0 && peer._handshakeComplete) {
+        // Fix 2: Relay inv IMMEDIATELY to other peers, then fetch tx in parallel.
+        // Old flow: inv → fetch tx (100ms) → relay inv. We lose the race.
+        // New flow: inv → relay inv + fetch tx simultaneously. Win more races.
+        let relayCount = 0
+        for (const [h, p] of this._peers) {
+          if (p !== peer && p._handshakeComplete) {
+            for (const t of newTxids) p.relayInv(t)
+            relayCount++
+          }
+        }
+        if (relayCount > 0) {
+          console.log(`[P2P relay] ${newTxids.length} inv → ${relayCount} peers (immediate)`)
+        }
+        // Fetch full tx from source (arrives later, stored in _txCache by tx handler)
+        peer.requestTxs(newTxids)
+      }
+    })
 
     try {
       await peer.connect(host, port)
@@ -482,31 +762,50 @@ export class BSVNodeClient extends EventEmitter {
    */
   async _maintainPeers () {
     if (this._destroyed) return
+    // Guard: skip if a previous maintain cycle is still running
+    if (this._maintaining) return
+    this._maintaining = true
 
-    // Clean disconnected peers
-    for (const [host, peer] of this._peers) {
-      if (!peer._connected) {
-        this._peers.delete(host)
-      }
-    }
-
-    // Reconnect to any new peers discovered via DNS
     try {
-      const addresses = await this._discoverPeers()
-      const newAddrs = addresses.filter(a => !this._peers.has(a.host))
-      for (const addr of newAddrs) {
-        this._connectToPeer(addr.host, addr.port)
+      // Clean disconnected peers
+      for (const [host, peer] of this._peers) {
+        if (!peer._connected) {
+          this._peers.delete(host)
+        }
       }
-    } catch {
-      // DNS failed during maintenance — try again next cycle
-    }
 
-    // Try peers from addr pool that aren't currently connected
-    for (const entry of this._addrPool) {
-      const [host, portStr] = entry.split(':')
-      if (!this._peers.has(host)) {
-        this._connectToPeer(host, parseInt(portStr, 10))
+      // Collect peers to reconnect
+      const toConnect = []
+
+      // DNS-discovered peers
+      try {
+        const addresses = await this._discoverPeers()
+        for (const addr of addresses) {
+          if (!this._peers.has(addr.host)) {
+            toConnect.push({ host: addr.host, port: addr.port })
+          }
+        }
+      } catch {
+        // DNS failed during maintenance — try again next cycle
       }
+
+      // Addr pool peers
+      for (const entry of this._addrPool) {
+        const [host, portStr] = entry.split(':')
+        if (!this._peers.has(host) && !toConnect.some(a => a.host === host)) {
+          toConnect.push({ host, port: parseInt(portStr, 10) })
+        }
+      }
+
+      // Cap at 20 per cycle to prevent hammering (145 addrs × 4 batch = 72s, overlapping the 60s timer)
+      const capped = toConnect.slice(0, 20)
+
+      // Stagger reconnections
+      if (capped.length > 0) {
+        await this._staggerConnect(capped, 'maintain')
+      }
+    } finally {
+      this._maintaining = false
     }
 
     // Ask existing peers for more addrs periodically
@@ -515,5 +814,71 @@ export class BSVNodeClient extends EventEmitter {
         peer.requestAddr()
       }
     }
+
+    // Persist good peers to file
+    this._saveGoodPeers()
+  }
+
+  /**
+   * Stagger connection attempts — 4 at a time with 2s gaps.
+   * Prevents hammering 26 peers simultaneously which triggers mass eviction.
+   */
+  async _staggerConnect (addresses, label) {
+    if (!addresses.length) return
+    const BATCH_SIZE = 4
+    const BATCH_DELAY_MS = 2000
+    const totalBatches = Math.ceil(addresses.length / BATCH_SIZE)
+    for (let i = 0; i < addresses.length; i += BATCH_SIZE) {
+      if (this._destroyed) return
+      const batchNum = Math.floor(i / BATCH_SIZE) + 1
+      const batch = addresses.slice(i, i + BATCH_SIZE)
+      console.log(`[P2P stagger] ${label} batch ${batchNum}/${totalBatches} (${batch.map(a => a.host).join(', ')})`)
+      for (const addr of batch) {
+        if (!this._peers.has(addr.host)) {
+          this._connectToPeer(addr.host, addr.port)
+        }
+      }
+      if (i + BATCH_SIZE < addresses.length) {
+        await new Promise(r => setTimeout(r, BATCH_DELAY_MS))
+      }
+    }
+  }
+
+  /**
+   * Load good peers from file. Called once on connect().
+   */
+  _loadGoodPeers () {
+    if (!this._persistPath) return
+    try {
+      const data = JSON.parse(readFileSync(this._persistPath, 'utf8'))
+      for (const entry of data) {
+        // Only load peers seen in last 24 hours
+        if (Date.now() - entry.lastSeen < 86400000) {
+          this._goodPeers.set(entry.host, { port: entry.port || 8333, lastSeen: entry.lastSeen })
+        }
+      }
+      if (this._goodPeers.size > 0) {
+        console.log(`[P2P] Loaded ${this._goodPeers.size} good peers from file`)
+      }
+    } catch {
+      // File doesn't exist yet — first run
+    }
+  }
+
+  /**
+   * Save good peers to file. Called every maintain cycle.
+   */
+  _saveGoodPeers () {
+    if (!this._persistPath) return
+    const peers = []
+    for (const [host, info] of this._goodPeers) {
+      // Only persist peers seen in last 24 hours
+      if (Date.now() - info.lastSeen < 86400000) {
+        peers.push({ host, port: info.port, lastSeen: info.lastSeen })
+      }
+    }
+    try {
+      writeFileSync(this._persistPath, JSON.stringify(peers, null, 2))
+    } catch {}
   }
 }

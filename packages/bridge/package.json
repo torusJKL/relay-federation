@@ -1,6 +1,6 @@
 {
   "name": "@relay-federation/bridge",
-  "version": "0.3.60",
+  "version": "4.0.0",
   "description": "Bridge server — WebSocket peering, header sync, tx relay, CLI",
   "type": "module",
   "bin": {
