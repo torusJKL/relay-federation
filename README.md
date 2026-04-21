@@ -12,7 +12,7 @@ We built the same thing for Bitcoin.
 
 **Transactions are the nutrients.** Broadcast to one bridge, and they propagate through the mesh to the entire BSV network.
 
-**7 bridges live. 422 tests passing. v4.0.0.**
+**7 bridges live. 422 tests passing. v4.2.0.**
 
 ---
 
@@ -157,13 +157,15 @@ BSV full nodes don't keep peers out of charity. They run an eviction algorithm (
 
 We read the BSV node source code (C++) alongside our bridge code (JavaScript) — two codebases, two languages, same protocol — and found four bugs in ourselves:
 
-**Fix 1 — We were stale.** Advertised block height 930,000 in our version handshake. Chain tip was 945,500. Full nodes saw us 15,000 blocks behind — dead on arrival. Now we sync headers first, connect with real height. One bridge went from 3 peers to 20 in ten minutes.
+**Fix 1 — We were stale.** Advertised block height 930,000 in our version handshake. Chain tip was 945,500. Full nodes saw us 15,000 blocks behind — dead on arrival. Now good peers are persisted to disk and headers sync naturally after handshake. One bridge went from 3 peers to 20 in ten minutes.
 
 **Fix 2 — We were slow.** Downloaded the full tx before telling peers about it. By then, someone else already relayed the `inv`. Now we forward the `inv` immediately, fetch the full tx in parallel. Novel relay acceptance: 0% → 98%.
 
 **Fix 3 — We were siloed.** Transactions from the federation mesh (port 18333) were logged but never forwarded to BSV peers (port 8333). Our entire mesh traffic generated zero novel relay credit. Now mesh→P2P relay is automatic.
 
-**Fix 4 — We were flooding.** Three overlapping reconnection cycles running simultaneously — 435 connection attempts per minute. BSV's `addrman.cpp` penalizes peers retried within 10 minutes (99% deprioritization) and marks peers "terrible" after 3 failures. We added a concurrency guard, 120-second cooldown, and demotion after 3 consecutive failures.
+**Fix 4 — We were flooding.** Three overlapping reconnection cycles running simultaneously — 435 connection attempts per minute. BSV's `addrman.cpp` penalizes peers retried within 10 minutes (99% deprioritization) and marks peers "terrible" after 3 failures. We added a concurrency guard, exponential backoff (30s base, 30-min cap), and demotion after 3 consecutive failures.
+
+**Fix 5 — We were getting banned.** Connect-disconnect spam triggered 24-hour IP bans on BSV nodes. Each reconnect attempt refreshed the ban timer — a death spiral. Now the bridge detects instant disconnects (<3 seconds, no handshake) as likely bans and applies maximum cooldown (30 minutes) to let the ban expire naturally. Result: 6 of 7 bridges recovered peers within 30 seconds of deploying the fix.
 
 **Result:** novel relay hit rates of 98%. Peer retention from minutes to hours. The bridges went from passive consumers to active participants in the BSV transaction relay network.
 
@@ -176,9 +178,9 @@ We read the BSV node source code (C++, `bitcoin-sv-1.1.1`) to learn what full no
 | 1 | **`inv`/`getdata`/`tx` three-step handshake** | Unsolicited `tx` messages are silently ignored. Your transaction never reaches miners. | `bsv-node-client.js` — broadcasts always send `inv` first, serve `tx` only on `getdata` response. Never push raw `tx`. |
 | 2 | **`services=0n` (NODE_NONE)** | Claiming `NODE_NETWORK` (`1n`) means full nodes will ask you for blocks. Can't serve them → misbehaving penalty. | `bsv-peer.js` — version message sets `services=0n`. We're SPV, we say we're SPV. |
 | 3 | **No bloom filters** | Sending `filterload` triggers `Misbehaving(100)` → instant 24-hour ban. `NODE_BLOOM` is disabled on BSV. | Never sent. All tx lookups use direct `getdata MSG_TX` with explicit txids. |
-| 4 | **Current block height in version** | Advertising stale height (e.g., 930K when tip is 945K) → deprioritised as dead node. | Headers sync first, then connect to remaining peers with real chain tip height. |
+| 4 | **Current block height in version** | Advertising stale height (e.g., 930K when tip is 945K) → deprioritised as dead node. | Good peers persisted to disk (warm start). Headers sync naturally after handshake via `getheaders`/`headers` exchange. |
 | 5 | **Novel tx relay** | `nLastTXTime` only updates when you relay a tx the node has *never seen*. First relayer wins. No novel relay = no eviction protection. | Immediate `inv` forwarding + shared `_txCache` + mesh→P2P relay. 98% hit rates. |
-| 6 | **Don't reconnect aggressively** | `addrman.cpp` penalises retries within 10 min (99% deprioritisation). 3 failures → "terrible". | 120s cooldown, concurrency guard, max 20 connections/cycle, 3-fail demotion. |
+| 6 | **Don't reconnect aggressively** | `addrman.cpp` penalises retries within 10 min (99% deprioritisation). 3 failures → "terrible". Instant disconnect = 24hr IP ban. | 30s base cooldown with exponential backoff (30-min cap). Ban detection: instant disconnect (<3s) triggers max cooldown to avoid refreshing bans. 3-fail demotion. |
 | 7 | **Respond to pings** | Full nodes send `ping` with a nonce. No `pong` response → connection dropped. | `bsv-peer.js` — automatic `pong` with matching nonce on every `ping`. |
 | 8 | **Send `protoconf` after handshake** | Protocol v70016+ requires `protoconf` declaring max message size. Missing it may cause large-message failures. | Sent immediately after `verack` — advertises 2MB max receive payload. |
 | 9 | **Handle `authch` silently** | Mining nodes send authentication challenges (MinerID). Crashing or disconnecting on unknown messages = bad peer. | Logged and ignored. Non-mining SPV clients have no MinerID key. Connection proceeds. |
