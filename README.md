@@ -171,7 +171,7 @@ We read the BSV node source code (C++) alongside our bridge code (JavaScript) �
 
 ### BSV Protocol Compliance — The 10 Rules
 
-We read the BSV node source code (C++, `bitcoin-sv-1.1.1`) to learn what full nodes expect from peers. Every rule is enforced — violate any one and you get disconnected, deprioritised, or banned. Here's what we learned and how the federation implements each:
+We read the BSV node source code (C++, `bitcoin-sv-1.2.1`) to learn what full nodes expect from peers. Every rule is enforced — violate any one and you get disconnected, deprioritised, or banned. Here's what we learned and how the federation implements each:
 
 | # | BSV Node Requirement | What Happens If You Break It | Federation Implementation |
 |---|---------------------|------------------------------|---------------------------|
