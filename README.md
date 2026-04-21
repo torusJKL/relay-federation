@@ -21,9 +21,11 @@ We built the same thing for Bitcoin.
 A federated mesh network of lightweight SPV bridge nodes for BSV. Each bridge:
 
 - Connects to 15-25 BSV full nodes via native P2P protocol (port 8333)
+- Subscribes to Teranode's libp2p gossip network — block announcements, tx batches, and miner status directly from the miner mesh
 - Accepts inbound connections from BSV nodes — bridges are peers, not parasites
 - Syncs 945,000+ block headers and verifies Merkle proofs
 - Relays novel transactions with 78-98% hit rates — earning eviction protection from full nodes
+- Translates between Teranode's gossip network and Bitcoin's legacy P2P protocol — data flows both directions
 - Discovers other bridges on-chain via CBOR-encoded OP_RETURN registry
 - Peers with other bridges over WebSocket (port 18333) with cryptographic identity
 - Serves apps via REST API (port 9333) with optional x402 micropayments
@@ -35,15 +37,15 @@ No full node. No third-party API. No single point of failure.
 
 ## Live Network
 
-| Bridge | Location | BSV Peers | Novel Relay | Role |
-|--------|----------|-----------|-------------|------|
-| 1 | Dallas, TX | 12-18 | 98% hit rate | General |
-| 2 | New Jersey | 17-20 | 98% hit rate | General |
-| 3 | Chicago, IL | 4-6 | 98% hit rate | General |
-| 4 | Dallas, TX | 3-20 | 98% hit rate | General |
-| 5 | Atlanta, GA | 4-20 | 98% hit rate | General |
-| 6 | Silicon Valley | 3-5 | 98% hit rate | General |
-| 7 | Silicon Valley | 4-7 | 98% hit rate | DNS seed crawler |
+| Bridge | Location | BSV Peers | Teranode | Novel Relay | Role |
+|--------|----------|-----------|----------|-------------|------|
+| 1 | Dallas, TX | 12-18 | 1 peer | 98% hit rate | General |
+| 2 | New Jersey | 17-20 | 1 peer | 98% hit rate | General |
+| 3 | Chicago, IL | 4-6 | 1 peer | 98% hit rate | General |
+| 4 | Dallas, TX | 3-20 | 1 peer | 98% hit rate | General |
+| 5 | Atlanta, GA | 4-20 | 1 peer | 98% hit rate | General |
+| 6 | Silicon Valley | 3-5 | 1 peer | 98% hit rate | General |
+| 7 | Silicon Valley | 4-7 | 1 peer | 98% hit rate | DNS seed crawler |
 
 All bridges registered on-chain with 1M sat Surety bond. All managed by systemd. All running `NODE_OPTIONS='--max-old-space-size=2048'`.
 
@@ -107,29 +109,44 @@ See the [Bridge Operator Handbook](BRIDGE_OPERATOR_HANDBOOK.md) for the full wal
 ## Architecture
 
 ```
-                        BSV P2P Network (port 8333)
-                     ┌──────────┼──────────┐
-                     ▼          ▼          ▼
-                 ┌────────┐ ┌────────┐ ┌────────┐
-                 │Bridge A│ │Bridge B│ │Bridge C│
-                 └───┬────┘ └───┬────┘ └───┬────┘
-                     │    WS    │    WS    │        ← port 18333
-                     └────┬─────┴────┬─────┘
-                          │   Mesh   │
-                     ┌────┴──────────┴────┐
-                     │  Federation Layer  │
-                     │  - Gossip          │
-                     │  - Peer Scoring    │
-                     │  - On-chain Beacon │
-                     └────────────────────┘
-                              │
-              ┌───────────────┼───────────────┐
-              ▼               ▼               ▼
-         ┌─────────┐   ┌──────────┐   ┌──────────┐
-         │ App :3000│   │ App :4000│   │ App :5000│    ← any hosting
-         └─────────┘   └──────────┘   └──────────┘
-                     REST API (port 9333)
+    Teranode Gossip (libp2p)          BSV P2P Network (port 8333)
+         │                         ┌──────────┼──────────┐
+         │  blocks, subtrees,      ▼          ▼          ▼
+         │  status, rejected   ┌────────┐ ┌────────┐ ┌────────┐
+         └────────────────────▶│Bridge A│ │Bridge B│ │Bridge C│
+                               └───┬────┘ └───┬────┘ └───┬────┘
+                                   │    WS    │    WS    │        ← port 18333
+                                   └────┬─────┴────┬─────┘
+                                        │   Mesh   │
+                                   ┌────┴──────────┴────┐
+                                   │  Federation Layer  │
+                                   │  - Gossip          │
+                                   │  - Peer Scoring    │
+                                   │  - On-chain Beacon │
+                                   └────────────────────┘
+                                            │
+                            ┌───────────────┼───────────────┐
+                            ▼               ▼               ▼
+                       ┌─────────┐   ┌──────────┐   ┌──────────┐
+                       │ App :3000│   │ App :4000│   │ App :5000│
+                       └─────────┘   └──────────┘   └──────────┘
+              ARC (HTTP) ──▶ Teranode          REST API (port 9333)
+              (tx broadcast)
 ```
+
+Transactions enter through ARC (HTTP POST to Teranode). Bridges hear them come back through the gossip network as subtree/block announcements. Write through one pipe, hear confirmation through another.
+
+### The Hydra — 5 Data Pipes
+
+| # | Pipe | Transport | Direction | Status |
+|---|------|-----------|-----------|--------|
+| 1 | **Teranode gossip** | libp2p GossipSub | Blocks, subtrees, status IN | Live — all 7 bridges |
+| 2 | **ARC** | HTTP POST | Transactions OUT to miners | Live |
+| 3 | **Legacy BSV P2P** | TCP wire protocol | Headers, txs, both directions | Live — ban-prone |
+| 4 | **Federation mesh** | WebSocket peering | Tx relay between bridges | Live |
+| 5 | **HTTP APIs** | GorillaPool, WoC | UTXO reads, tx lookups | Live |
+
+Any one goes down, the others keep feeding. All different transport types — no single failure mode takes out more than one.
 
 ### Three Ports, Three Protocols
 
@@ -210,13 +227,14 @@ For a forest, this is worse than fire. It's the loss of spore flow. Existing tre
 
 So we built the federation's reproductive system. Bridge-7 runs a crawler that probes 2,100+ known BSV peers every five minutes, categorizing each by failure mode. The first run revealed that 74% of "known" peers were ghosts — IPs from years ago running something else entirely. The crawler prunes the ghosts. It's how the mycelium forgets dead soil and remembers live soil.
 
-The federation now discovers peers through four independent mechanisms:
-1. **Good peer persistence** — `good-peers.json` loaded on startup (warm start, not cold)
-2. **DNS seeds** — including `seed.indelible.one` (our own, 26+ verified peers)
-3. **Native P2P peer exchange** — `getaddr`/`addr` built into Bitcoin itself
-4. **On-chain beacon** — bridges register on-chain, discovered by scanning the blockchain
+The federation now discovers peers through five independent mechanisms:
+1. **Teranode gossip** — `node_status` messages from the miner mesh identify active miners and their endpoints
+2. **Good peer persistence** — `good-peers.json` loaded on startup (warm start, not cold)
+3. **DNS seeds** — including `seed.indelible.one` (our own, 26+ verified peers)
+4. **Native P2P peer exchange** — `getaddr`/`addr` built into Bitcoin itself
+5. **On-chain beacon** — bridges register on-chain, discovered by scanning the blockchain
 
-If every legacy DNS seed dies tomorrow, the federation keeps running.
+If every legacy DNS seed dies tomorrow, the federation keeps running. If BSV P2P nodes ban us, Teranode gossip keeps feeding data.
 
 ---
 
@@ -249,6 +267,8 @@ Optional HTTP 402-based micropayment layer. The two-sided flywheel that makes th
 
 ## Features
 
+- **Teranode gossip** — subscribes to the miner mesh via libp2p, receives block announcements, tx batches, rejected txs, and node status in real time
+- **ARC broadcast** — transactions sent directly to Teranode via ARC HTTP, with federation bridges as fallback
 - **SPV verification** — header sync from BSV P2P nodes, Merkle proof generation and validation
 - **Transaction relay** — broadcast, lookup, UTXO queries, full address history
 - **Novel tx relay** — immediate `inv` forwarding, shared tx cache, 98% hit rates
@@ -432,7 +452,7 @@ Apps are consumers of the REST API — they run anywhere and talk to bridges ove
 
 | Dependency | Minimum | Notes |
 |---|---|---|
-| Node.js | 18.0.0 | ESM, `node:test`, `node:crypto` |
+| Node.js | 22.0.0 | Required for Teranode listener (libp2p gossipsub race condition on v20) |
 | npm | 7.0.0 | Workspace support |
 
 Runtime dependencies (auto-installed):
@@ -440,6 +460,7 @@ Runtime dependencies (auto-installed):
 | Package | Purpose |
 |---|---|
 | `@bsv/sdk` | secp256k1, ECDSA, transaction building |
+| `@bsv/teranode-listener` | Teranode libp2p gossip subscription |
 | `level` | LevelDB (headers, peers, txs, tokens) |
 | `ws` | WebSocket mesh peering |
 | `cborg` | CBOR encoding for on-chain registry |
