@@ -10,12 +10,14 @@ import { EventEmitter } from 'node:events'
  * 4. We store it and re-announce to other peers
  *
  * Message types:
- *   tx_announce — { type, txid }
- *   tx_request  — { type, txid }
- *   tx          — { type, txid, rawHex }
+ *   tx_announce   — { type, txid }
+ *   tx_request    — { type, txid }
+ *   tx            — { type, txid, rawHex }
+ *   tx_confirmed  — { type, txid, source, bsvPeers, bridge, ts }
  *
  * Events:
- *   'tx:new' — { txid, rawHex } — new transaction received or submitted
+ *   'tx:new'       — { txid, rawHex } — new transaction received or submitted
+ *   'tx:confirmed' — { txid, source, bsvPeers, bridge, ts } — remote bridge confirmed broadcast
  */
 export class TxRelay extends EventEmitter {
   /**
@@ -26,6 +28,7 @@ export class TxRelay extends EventEmitter {
   constructor (peerManager, opts = {}) {
     super()
     this.peerManager = peerManager
+    this.bridgeName = opts.bridgeName || 'unknown'
     /** @type {Map<string, string>} txid → rawHex */
     this.mempool = new Map()
     /** @type {Set<string>} txids we've already seen (dedup) */
@@ -37,6 +40,11 @@ export class TxRelay extends EventEmitter {
     this.knownTxids = new Map()
     this._knownTxidMax = opts.maxKnownTxids || 10000
     this._knownTxidTtlMs = opts.knownTxidTtlMs || 600000 // 10 min
+
+    /** @type {Map<string, Array>} txid → array of confirmation reports from other bridges */
+    this.confirmations = new Map()
+    this._confirmMax = 5000
+    this._confirmTtlMs = 120000 // 2 min — short-lived, just for the broadcast response window
 
     this.peerManager.on('peer:message', ({ pubkeyHex, message }) => {
       this._handleMessage(pubkeyHex, message)
@@ -89,6 +97,35 @@ export class TxRelay extends EventEmitter {
     return this.seen.has(txid) || this.knownTxids.has(txid)
   }
 
+  /**
+   * Report that THIS bridge confirmed a tx to BSV miners.
+   * Gossips the confirmation to all mesh peers so the originator can collect the aggregate.
+   * @param {string} txid
+   * @param {string} source — 'p2p', 'arc', or 'woc'
+   * @param {number} bsvPeers — number of BSV P2P peers that accepted
+   */
+  confirmTx (txid, source, bsvPeers = 0) {
+    const report = { txid, source, bsvPeers, bridge: this.bridgeName, ts: Date.now() }
+    this._storeConfirmation(txid, report)
+    this.peerManager.broadcast({ type: 'tx_confirmed', ...report })
+  }
+
+  /**
+   * Get all confirmation reports for a txid (local + remote).
+   * @param {string} txid
+   * @returns {{ bridges: number, totalBsvPeers: number, confirmations: Array }}
+   */
+  getConfirmations (txid) {
+    const reports = this.confirmations.get(txid) || []
+    let totalBsvPeers = 0
+    for (const r of reports) totalBsvPeers += r.bsvPeers || 0
+    return {
+      bridges: reports.length,
+      totalBsvPeers,
+      confirmations: reports
+    }
+  }
+
   /** @private — add txid to seen set with LRU eviction */
   _trackSeen (txid) {
     if (this.seen.has(txid)) return
@@ -107,6 +144,22 @@ export class TxRelay extends EventEmitter {
     this.mempool.set(txid, rawHex)
   }
 
+  /** @private — store a confirmation report with LRU eviction */
+  _storeConfirmation (txid, report) {
+    if (!this.confirmations.has(txid)) {
+      if (this.confirmations.size >= this._confirmMax) {
+        const oldest = this.confirmations.keys().next().value
+        this.confirmations.delete(oldest)
+      }
+      this.confirmations.set(txid, [])
+    }
+    const arr = this.confirmations.get(txid)
+    // Dedup by bridge name
+    if (!arr.some(r => r.bridge === report.bridge)) {
+      arr.push(report)
+    }
+  }
+
   /** @private */
   _handleMessage (pubkeyHex, message) {
     switch (message.type) {
@@ -118,6 +171,9 @@ export class TxRelay extends EventEmitter {
         break
       case 'tx':
         this._onTx(pubkeyHex, message)
+        break
+      case 'tx_confirmed':
+        this._onTxConfirmed(pubkeyHex, message)
         break
     }
   }
@@ -151,5 +207,19 @@ export class TxRelay extends EventEmitter {
     this.emit('tx:new', { txid: msg.txid, rawHex: msg.rawHex })
     // Re-announce to all peers except the source
     this.peerManager.broadcast({ type: 'tx_announce', txid: msg.txid }, pubkeyHex)
+  }
+
+  /** @private — remote bridge confirmed a tx broadcast */
+  _onTxConfirmed (pubkeyHex, msg) {
+    if (!msg.txid) return
+    const report = {
+      txid: msg.txid,
+      source: msg.source || 'unknown',
+      bsvPeers: msg.bsvPeers || 0,
+      bridge: msg.bridge || pubkeyHex.slice(0, 16),
+      ts: msg.ts || Date.now()
+    }
+    this._storeConfirmation(msg.txid, report)
+    this.emit('tx:confirmed', report)
   }
 }

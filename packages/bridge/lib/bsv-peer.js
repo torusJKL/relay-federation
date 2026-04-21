@@ -31,7 +31,7 @@ import { createHash, randomBytes } from 'node:crypto'
 // BSV mainnet magic bytes
 const MAGIC = Buffer.from('e3e1f3e8', 'hex')
 const PROTOCOL_VERSION = 70016
-const USER_AGENT = '/Indelible Bridge:0.3.52/'
+const USER_AGENT = '/Bitcoin SV:1.2.1/'
 const HEADER_BYTES = 80
 const MSG_HEADER_SIZE = 24
 
@@ -473,6 +473,7 @@ export class BSVPeer extends EventEmitter {
 
   _onDisconnect () {
     const host = this._host
+    const wasHandshaked = this._handshakeComplete
     this._connected = false
     this._handshakeComplete = false
     this._syncing = false
@@ -480,6 +481,9 @@ export class BSVPeer extends EventEmitter {
     clearInterval(this._pingTimer)
     this._syncTimer = null
     this._pingTimer = null
+    if (!wasHandshaked) {
+      console.log(`[P2P] ${host}:${this._port} dropped before handshake (banned or incompatible)`)
+    }
     this.emit('disconnected', { host, port: this._port })
   }
 
@@ -893,7 +897,7 @@ export class BSVPeer extends EventEmitter {
     let offset = 0
 
     payload.writeInt32LE(PROTOCOL_VERSION, offset); offset += 4
-    payload.writeBigUInt64LE(0n, offset); offset += 8 // services = 0 (not a full node)
+    payload.writeBigUInt64LE(1n, offset); offset += 8 // services = NODE_NETWORK (required to not get dropped)
     const now = BigInt(Math.floor(Date.now() / 1000))
     payload.writeBigUInt64LE(now, offset); offset += 8
     offset += writeNetAddr(payload, offset, 1n, this._host || '127.0.0.1', this._port || 8333)

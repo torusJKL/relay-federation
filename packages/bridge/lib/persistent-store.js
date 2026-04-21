@@ -263,7 +263,7 @@ export class PersistentStore extends EventEmitter {
    */
   async putUtxo (utxo) {
     const key = `${utxo.txid}:${utxo.vout}`
-    await this._utxos.put(key, { ...utxo, spent: false })
+    await this._utxos.put(key, { ...utxo, spent: false, addedAt: Date.now() })
   }
 
   /**
@@ -382,6 +382,16 @@ export class PersistentStore extends EventEmitter {
     } catch {
       return false
     }
+  }
+
+  /**
+   * Clear a false spent-input entry (e.g. when GP confirms UTXO is unspent).
+   * @param {string} txid
+   * @param {number} vout
+   */
+  async clearSpentInput (txid, vout) {
+    const key = `${txid}:${vout}`
+    try { await this._spentInputs.del(key) } catch {}
   }
 
   /**

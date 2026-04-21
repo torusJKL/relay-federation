@@ -53,6 +53,7 @@ export class StatusServer {
     this._scorer = opts.scorer || null
     this._peerHealth = opts.peerHealth || null
     this._bsvNodeClient = opts.bsvNodeClient || null
+    this._teranodeClient = opts.teranodeClient || null
     this._store = opts.store || null
     this._addressWatcher = opts.addressWatcher || null
     this._performOutboundHandshake = opts.performOutboundHandshake || null
@@ -188,8 +189,10 @@ export class StatusServer {
       bsvNode: {
         connected: this._bsvNodeClient ? this._bsvNodeClient.connectedCount > 0 : false,
         peers: this._bsvNodeClient ? this._bsvNodeClient.connectedCount : 0,
-        height: this._bsvNodeClient ? this._bsvNodeClient.bestHeight : null
+        height: this._bsvNodeClient ? this._bsvNodeClient.bestHeight : null,
+        peerList: this._bsvNodeClient ? this._bsvNodeClient.peerList : []
       },
+      teranode: this._teranodeClient ? this._teranodeClient.getStatus() : { enabled: false },
       system: {
         totalMemMB: Math.round(os.totalmem() / 1048576),
         freeMemMB: Math.round(os.freemem() / 1048576),
@@ -726,9 +729,16 @@ export class StatusServer {
         }
       }
 
+      // Gossip our confirmation to the federation mesh
+      if (confirmed && this._txRelay) {
+        const bsvPeers = this._bsvNodeClient ? this._bsvNodeClient.connectedCount : 0
+        this._txRelay.confirmTx(txid, confirmSource, bsvPeers)
+      }
+
       if (confirmed) {
+        const fed = this._txRelay ? this._txRelay.getConfirmations(txid) : { bridges: 0, totalBsvPeers: 0, confirmations: [] }
         res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ txid, peers: relayPeers, confirmed: true, source: confirmSource }))
+        res.end(JSON.stringify({ txid, peers: relayPeers, confirmed: true, source: confirmSource, federation: fed }))
       } else {
         res.writeHead(502, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ error: 'Broadcast failed — no miner accepted the transaction', txid }))
@@ -1601,13 +1611,14 @@ export class StatusServer {
 
       const [localUtxos, gpData] = await Promise.all([localPromise, gpPromise])
 
+      // Debug logs removed
       // Merge GP + local, filtering out UTXOs spent by recent broadcasts.
       // GP is authoritative for confirmed UTXOs but doesn't know about
       // unconfirmed spends. Local store tracks both new outputs and spends.
       const seen = new Set()
       const merged = []
 
-      // Start with GP data, filter out locally-spent inputs
+      // Start with GP data — GP is authoritative for confirmed UTXOs
       for (const u of gpData) {
         const key = `${u.txid}:${u.vout}`
         if (seen.has(key)) continue
@@ -1615,17 +1626,51 @@ export class StatusServer {
         if (this._store) {
           try { spent = await this._store.isInputSpent(u.txid, u.vout) } catch {}
         }
-        if (!spent) { seen.add(key); merged.push({ tx_hash: u.txid, tx_pos: u.vout, value: u.satoshis, height: u.height || -1 }) }
+        // GP is authoritative for confirmed UTXOs. If GP says unspent AND
+        // confirmed (height > 0), our local spentInputs entry is stale.
+        if (spent && u.height > 0 && this._store) {
+          console.log(`[ghost-fix] Clearing stale spent entry: ${key} (GP height ${u.height})`)
+          try { await this._store.clearSpentInput(u.txid, u.vout) } catch {}
+          spent = false
+        }
+        if (!spent) { seen.add(key); merged.push({ tx_hash: u.txid, tx_pos: u.vout, value: Number(u.satoshis), height: u.height || -1 }) }
       }
 
-      // Add local unspent UTXOs that GP doesn't have (unconfirmed outputs)
+      // Add local unspent UTXOs that GP doesn't have — but ONLY if recent.
+      // GP is truth for the confirmed UTXO set. If GP doesn't have it, it's
+      // either a very recent broadcast (not yet indexed) or a ghost UTXO
+      // (spent on-chain but local store never saw the spending tx).
+      // Only include local-only UTXOs created in the last 120 seconds.
+      const recentCutoff = Date.now() - 120000
       for (const u of localUtxos) {
         const key = `${u.txid}:${u.vout}`
-        if (!seen.has(key)) { seen.add(key); merged.push({ tx_hash: u.txid, tx_pos: u.vout, value: u.satoshis, height: -1 }) }
+        if (seen.has(key)) continue
+        // Only include if recently added (unconfirmed broadcast we just did)
+        if (u.addedAt && u.addedAt > recentCutoff) {
+          seen.add(key)
+          merged.push({ tx_hash: u.txid, tx_pos: u.vout, value: Number(u.satoshis), height: -1 })
+        } else {
+          // Ghost UTXO — GP doesn't have it, it's old. Mark as spent.
+          if (this._store) {
+            try { await this._store.spendUtxo(u.txid, u.vout) } catch {}
+          }
+        }
       }
 
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(merged))
+      return
+    }
+
+    // GET /api/tx/:txid/propagation — federation-wide confirmation status
+    const propMatch = path.match(/^\/api\/tx\/([0-9a-f]{64})\/propagation$/)
+    if (req.method === 'GET' && propMatch) {
+      const txid = propMatch[1]
+      const fed = this._txRelay ? this._txRelay.getConfirmations(txid) : { bridges: 0, totalBsvPeers: 0, confirmations: [] }
+      const known = this._txRelay ? this._txRelay.hasSeen(txid) : false
+      const inMempool = this._txRelay ? this._txRelay.mempool.has(txid) : false
+      res.writeHead(200, { ...this._corsHeaders, 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ txid, known, inMempool, federation: fed }))
       return
     }
 
@@ -1758,9 +1803,16 @@ export class StatusServer {
         }
       }
 
+      // Gossip our confirmation to the federation mesh
+      if (confirmed && this._txRelay) {
+        const bsvPeers = this._bsvNodeClient ? this._bsvNodeClient.connectedCount : 0
+        this._txRelay.confirmTx(txid, confirmSource, bsvPeers)
+      }
+
       if (confirmed) {
+        const fed = this._txRelay ? this._txRelay.getConfirmations(txid) : { bridges: 0, totalBsvPeers: 0, confirmations: [] }
         res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ txid, peers: relayPeers, confirmed: true, source: confirmSource }))
+        res.end(JSON.stringify({ txid, peers: relayPeers, confirmed: true, source: confirmSource, federation: fed }))
       } else {
         console.error('[broadcast] ALL PATHS FAILED for', txid.slice(0, 16))
         res.writeHead(502, { 'Content-Type': 'application/json' })

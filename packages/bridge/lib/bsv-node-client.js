@@ -125,6 +125,32 @@ export class BSVNodeClient extends EventEmitter {
   }
 
   /**
+   * Bootstrap from federation mesh before connecting to P2P.
+   * Updates checkpoint to mesh tip so we advertise the correct height
+   * and prioritizes known-good BSV peers from mesh bridges.
+   * @param {{ height: number, hash: string }} tip — current chain tip from mesh
+   * @param {string[]} [goodPeerIps] — BSV peer IPs confirmed working by mesh bridges
+   */
+  meshBootstrap (tip, goodPeerIps = []) {
+    if (tip && tip.height > this._bestHeight) {
+      this._bestHeight = tip.height
+      this._bestHash = tip.hash || this._bestHash
+      if (tip.hash) {
+        this._sharedHeaderHashes.set(tip.height, tip.hash)
+        this._sharedHashToHeight.set(tip.hash, tip.height)
+      }
+      console.log(`[P2P] Mesh bootstrap: tip height ${tip.height}`)
+    }
+    // Inject mesh-provided peers as top-priority good peers
+    for (const ip of goodPeerIps) {
+      this._goodPeers.set(ip, { port: 8333, lastSeen: Date.now() })
+    }
+    if (goodPeerIps.length) {
+      console.log(`[P2P] Mesh bootstrap: ${goodPeerIps.length} known-good BSV peers`)
+    }
+  }
+
+  /**
    * Discover BSV nodes via DNS seeds and connect to all discovered peers.
    * Emits 'connected' and 'handshake' events as peers come online.
    * Does not block — connections established in background.

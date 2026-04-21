@@ -1,6 +1,6 @@
 {
   "name": "@relay-federation/bridge",
-  "version": "4.2.0",
+  "version": "4.2.5",
   "description": "Bridge server — WebSocket peering, header sync, tx relay, CLI",
   "type": "module",
   "bin": {
@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@bsv/sdk": "^1.10.1",
+    "@bsv/teranode-listener": "^1.0.1",
     "@relay-federation/common": "^0.2.0",
     "@relay-federation/registry": "^0.2.0",
     "level": "^10.0.0",

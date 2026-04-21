@@ -481,7 +481,7 @@ async function cmdStart () {
   // ── 2. Core components ────────────────────────────────────
   const peerManager = new PeerManager()
   const headerRelay = new HeaderRelay(peerManager)
-  const txRelay = new TxRelay(peerManager)
+  const txRelay = new TxRelay(peerManager, { bridgeName: config.name })
   const dataRelay = new DataRelay(peerManager)
   const sessionRelay = new SessionRelay(peerManager, store)
 
@@ -781,6 +781,47 @@ async function cmdStart () {
     crawlerUrl: 'http://66.135.31.144:9333/api/crawler/peers'
   })
 
+  // ── 6b-mesh. Bootstrap P2P from federation mesh ──────────
+  // Query mesh peers for their tip height + connected BSV peer IPs
+  // so we connect to P2P with an accurate height and known-good peers.
+  {
+    const meshPeerIps = new Set()
+    let meshTip = null
+    const meshConns = [...peerManager.peers.values()].filter(c => c.connected)
+    if (meshConns.length > 0) {
+      console.log(`[P2P] Bootstrapping from ${meshConns.length} mesh peers...`)
+      const fetches = meshConns.map(async (conn) => {
+        try {
+          // Convert ws://IP:8333 to http://IP:9333/status
+          const ep = conn.endpoint.replace('ws://', 'http://').replace('wss://', 'https://').replace(':8333', ':9333').replace(':18333', ':9333')
+          const res = await fetch(`${ep}/status`, { signal: AbortSignal.timeout(5000) })
+          if (!res.ok) return
+          const status = await res.json()
+          // Grab their tip
+          if (status.headers && status.headers.bestHeight > 0) {
+            if (!meshTip || status.headers.bestHeight > meshTip.height) {
+              meshTip = { height: status.headers.bestHeight, hash: status.headers.bestHash }
+            }
+          }
+          // Grab their connected BSV peer IPs
+          if (status.bsvNode && status.bsvNode.peers > 0 && status.bsvNode.peerList) {
+            for (const p of status.bsvNode.peerList) {
+              if (p.handshake && p.host) meshPeerIps.add(p.host)
+            }
+          }
+        } catch {}
+      })
+      await Promise.allSettled(fetches)
+    }
+    // Also use headerRelay if it already has a tip from mesh header sync
+    if (headerRelay.bestHeight > 0 && (!meshTip || headerRelay.bestHeight > meshTip.height)) {
+      meshTip = { height: headerRelay.bestHeight, hash: headerRelay.bestHash }
+    }
+    if (meshTip || meshPeerIps.size > 0) {
+      bsvNode.meshBootstrap(meshTip, [...meshPeerIps])
+    }
+  }
+
   bsvNode.on('headers', async ({ headers, count }) => {
     // Feed into HeaderRelay for peer propagation
     const added = headerRelay.addHeaders(headers)
@@ -806,10 +847,8 @@ async function cmdStart () {
   })
 
   bsvNode.on('error', (err) => {
-    // Don't crash — just log
-    if (err.code !== 'ECONNREFUSED' && err.code !== 'ETIMEDOUT') {
-      console.log(`BSV P2P: ${err.message}`)
-    }
+    // Don't crash — just log. Show all errors so we can diagnose peer loss.
+    console.log(`BSV P2P: ${err.code || 'ERROR'} — ${err.message}`)
   })
 
   // Track txids announced via BSV P2P inv (tx fetching handled by bsv-node-client relay)
@@ -828,6 +867,38 @@ async function cmdStart () {
 
   // Start the BSV P2P connection
   bsvNode.connect()
+
+  // ── 6c. Teranode gossip — Pipe #4: direct miner mesh via libp2p ──
+  const { TeranodeClient } = await import('./lib/teranode-client.js')
+  const teranodeClient = new TeranodeClient({
+    enabled: config.teranode?.enabled !== false, // enabled by default
+    network: config.teranode?.network || 'mainnet'
+  })
+
+  teranodeClient.on('bestblock', ({ data }) => {
+    if (data && !data.raw) {
+      console.log(`Teranode: best block update — ${JSON.stringify(data).slice(0, 120)}`)
+    }
+  })
+
+  teranodeClient.on('block', ({ data }) => {
+    if (data && !data.raw) {
+      console.log(`Teranode: new block — ${JSON.stringify(data).slice(0, 120)}`)
+    }
+  })
+
+  teranodeClient.on('subtree', ({ data }) => {
+    // Subtree = tx batch from miners. Future: feed into txRelay
+    // For now, just count them (logged in teranode-client.js status)
+  })
+
+  teranodeClient.on('rejected_tx', ({ data }) => {
+    if (data && !data.raw) {
+      console.log(`Teranode: rejected tx — ${JSON.stringify(data).slice(0, 120)}`)
+    }
+  })
+
+  await teranodeClient.connect()
 
   // ── 7. Connect to peers ───────────────────────────────────
   let gossipStarted = false
@@ -976,6 +1047,7 @@ async function cmdStart () {
     scorer,
     peerHealth,
     bsvNodeClient: bsvNode,
+    teranodeClient,
     store,
     addressWatcher: watcher,
     performOutboundHandshake,
@@ -1118,6 +1190,7 @@ async function cmdStart () {
     clearInterval(healthTimer)
     anchorManager.stopMonitoring()
     bsvNode.disconnect()
+    await teranodeClient.disconnect()
     gossipManager.stop()
     await statusServer.stop()
     await peerManager.shutdown()
