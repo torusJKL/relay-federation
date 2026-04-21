@@ -79,8 +79,8 @@ export class BSVNodeClient extends EventEmitter {
 
     // Reconnect backoff: host → { until: timestamp, delay: ms }
     this._peerCooldown = new Map()
-    this._baseCooldownMs = 120000      // 2 min initial cooldown (must exceed 60s maintain interval)
-    this._maxCooldownMs = 600000      // 10 min cap
+    this._baseCooldownMs = 30000       // 30s initial cooldown
+    this._maxCooldownMs = 1800000      // 30 min cap (prevents refreshing 24hr bans on BSV nodes)
     // Permanent blacklist for non-BSV peers (BCH/BTC) — never reconnect
     this._blacklist = new Set()
 
@@ -145,36 +145,15 @@ export class BSVNodeClient extends EventEmitter {
       [addresses[i], addresses[j]] = [addresses[j], addresses[i]]
     }
 
-    // Filter out already-connected
+    // Merge good peers + discovered, deduplicate
     const dnsAddrs = addresses.filter(a => !goodAddrs.some(g => g.host === a.host))
-
-    // Fix 1: Connect to 1 peer first, sync headers to chain tip, then connect to the rest.
-    // Without this, our version message advertises checkpoint height (930,000) to every peer,
-    // making us look 15,000+ blocks behind. BSV nodes throttle tx relay to unsynced peers.
     const allAddrs = [...goodAddrs, ...dnsAddrs]
-    if (allAddrs.length > 0) {
-      const [first, ...rest] = allAddrs
-      console.log(`[P2P] Syncing headers from ${first.host} before connecting to pack...`)
-      this._connectToPeer(first.host, first.port)
 
-      // Wait for handshake + header sync (up to 60s)
-      try {
-        const peerStartHeight = await new Promise((resolve, reject) => {
-          const timer = setTimeout(() => reject(new Error('timeout')), 15000)
-          this.once('handshake', ({ startHeight }) => {
-            clearTimeout(timer)
-            resolve(startHeight)
-          })
-        })
-        await this.waitForSync(peerStartHeight, 45000)
-        console.log(`[P2P] Headers synced to ${this._bestHeight} — connecting to pack`)
-      } catch (err) {
-        console.log(`[P2P] Header sync skipped (${err.message}) — connecting anyway at height ${this._bestHeight}`)
-      }
-
-      // Now connect to the rest — version messages will have correct height
-      const remaining = rest.filter(a => !this._peers.has(a.host))
-      await this._staggerConnect(remaining, 'pack')
+    // Connect to all peers — cooldown handles throttling, no stagger needed.
+    // Headers sync naturally via getheaders/headers exchange after handshake.
+    console.log(`[P2P] Connecting to ${allAddrs.length} peers (${goodAddrs.length} good, ${dnsAddrs.length} discovered)`)
+    for (const addr of allAddrs) {
+      this._connectToPeer(addr.host, addr.port)
     }
 
     // Start maintenance timer
@@ -649,6 +628,7 @@ export class BSVNodeClient extends EventEmitter {
     })
 
     this._peers.set(host, peer)
+    const connectTime = Date.now()
 
     // Wire events — proxy to callers
     peer.on('headers', (data) => {
@@ -670,8 +650,8 @@ export class BSVNodeClient extends EventEmitter {
 
     peer.on('connected', (data) => this.emit('connected', data))
     peer.on('handshake', (data) => {
-      // Don't clear cooldown on handshake — wait for stable connection
-      // Cooldown is cleared only after receiving headers (see 'headers' handler)
+      // Handshake success = peer accepted us. Clear cooldown immediately.
+      this._clearCooldown(host)
       this.emit('handshake', data)
       // Ask this peer for its known peers
       peer.requestAddr()
@@ -704,8 +684,14 @@ export class BSVNodeClient extends EventEmitter {
           const gp = this._goodPeers.get(host)
           gp.consecutiveFails = (gp.consecutiveFails || 0) + 1
         }
-        // Normal disconnect — exponential backoff
-        this._applyCooldown(host)
+        // Ban detection: instant disconnect without handshake = likely IP-banned.
+        // Apply 30-min cooldown to avoid refreshing the remote node's 24hr ban timer.
+        const elapsed = Date.now() - connectTime
+        if (!peer._handshakeComplete && elapsed < 3000) {
+          this._applyCooldown(host, this._maxCooldownMs) // 30 min — suspected ban
+        } else {
+          this._applyCooldown(host)
+        }
       }
       this.emit('disconnected', data)
     })
@@ -797,12 +783,10 @@ export class BSVNodeClient extends EventEmitter {
         }
       }
 
-      // Cap at 20 per cycle to prevent hammering (145 addrs × 4 batch = 72s, overlapping the 60s timer)
-      const capped = toConnect.slice(0, 20)
-
-      // Stagger reconnections
-      if (capped.length > 0) {
-        await this._staggerConnect(capped, 'maintain')
+      // Connect to all discovered peers — cooldown handles throttling per-host.
+      // Banned hosts get 30-min cooldown, normal failures get exponential backoff.
+      for (const addr of toConnect) {
+        this._connectToPeer(addr.host, addr.port)
       }
     } finally {
       this._maintaining = false
