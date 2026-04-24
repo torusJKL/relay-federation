@@ -285,7 +285,7 @@ Optional HTTP 402-based micropayment layer. The two-sided flywheel that makes th
 - **Price feed** — live BSV/USD
 - **Federation mesh** — on-chain discovery, cryptographic handshake, peer scoring
 - **Operator dashboard** — glassmorphism UI with 3D mesh topology (Three.js), 6 tabs
-- **422 tests passing** (330 bridge + 92 common/registry/sdk) — MIT license
+- **422 tests passing** (330 bridge + 92 common/registry/sdk)
 
 ---
 
@@ -470,7 +470,7 @@ No native compilation. No external services. Single Node.js process.
 ## Development
 
 ```bash
-git clone https://github.com/zcoolz/relay-federation.git
+git clone https://github.com/indelible-federation/relay-federation.git
 cd relay-federation
 npm install
 npm test --workspace=packages/bridge   # 330 tests
@@ -486,7 +486,7 @@ They just work. For a billion years.
 
 Because the incentives align. The old trees help the young ones because a healthy forest benefits everyone. The mycelium spreads because there's value in connecting more nodes.
 
-That's what we built. Not a company. Not a protocol. **An ecosystem.**
+That's what we built. **An ecosystem.**
 
 The mycelium is live. Just tap in.
 
@@ -498,4 +498,6 @@ The mycelium is live. Just tap in.
 
 ## License
 
-MIT
+Business Source License 1.1 (BSL) — see [LICENSE](LICENSE)
+
+Free for personal, educational, and non-commercial use. Commercial use of competing relay/federation services requires written permission from the Licensor. Converts to MIT on April 23, 2030.
