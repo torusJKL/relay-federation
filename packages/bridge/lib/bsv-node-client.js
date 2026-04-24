@@ -524,6 +524,7 @@ export class BSVNodeClient extends EventEmitter {
   /** List of connected peers with status info */
   get peerList () {
     const list = []
+    if (!this._peers) return list
     for (const [host, peer] of this._peers) {
       list.push({
         host,
