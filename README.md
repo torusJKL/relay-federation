@@ -12,7 +12,7 @@ We built the same thing for Bitcoin.
 
 **Transactions are the nutrients.** Broadcast to one bridge, and they propagate through the mesh to the entire BSV network.
 
-**7 bridges live. 422 tests passing. v4.2.0.**
+**8 bridges live. 422 tests passing. 2 continents.**
 
 ---
 
@@ -46,6 +46,7 @@ No full node. No third-party API. No single point of failure.
 | 5 | Atlanta, GA | 4-20 | 1 peer | 98% hit rate | General |
 | 6 | Silicon Valley | 3-5 | 1 peer | 98% hit rate | General |
 | 7 | Silicon Valley | 4-7 | 1 peer | 98% hit rate | DNS seed crawler |
+| 8 | Helsinki, FI | 4+ | 1 peer | — | Community operator |
 
 All bridges registered on-chain with 1M sat Surety bond. All managed by systemd. All running `NODE_OPTIONS='--max-old-space-size=2048'`.
 

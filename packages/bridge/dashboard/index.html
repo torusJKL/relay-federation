@@ -1076,9 +1076,22 @@ function generateQR(text) {
 // ── Configuration ──────────────────────────────────
 // Bootstrap from self — discover the rest of the mesh via /discover
 const SEED_URLS = [window.location.origin];
+const SELF_ORIGIN = window.location.origin;
 let BRIDGES = SEED_URLS.map(url => ({ name: null, url }));
 const POLL_INTERVAL = 5000;
 let discoveryDone = false;
+
+// Proxy helper — routes cross-origin requests through own bridge to avoid mixed-content
+function meshFetch(url, opts) {
+  try {
+    const target = new URL(url);
+    const self = new URL(SELF_ORIGIN);
+    // Same origin — fetch directly
+    if (target.origin === self.origin) return fetch(url, opts);
+    // Different origin — proxy through own bridge
+    return fetch(SELF_ORIGIN + '/mesh/proxy?url=' + encodeURIComponent(url), opts);
+  } catch { return fetch(url, opts); }
+}
 
 const BOND_EXPLAINER = '<h2>Surety Bond (BND)</h2>' +
   '<div style="color:var(--text-muted);font-size:13px;line-height:1.6;max-width:480px">' +
@@ -1394,7 +1407,7 @@ async function fetchBridge(bridge) {
     };
   }
   try {
-    const r = await fetch(bridge.url + '/status' + getAuthParam(bridge.url), { signal: AbortSignal.timeout(5000) });
+    const r = await meshFetch(bridge.url + '/status' + getAuthParam(bridge.url), { signal: AbortSignal.timeout(5000) });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const data = await r.json();
     // Bridge self-reports its name — use that as canonical, fall back to URL-derived name
@@ -1418,7 +1431,7 @@ async function fetchBridge(bridge) {
 async function fetchMempool(bridge) {
   if (!bridge.url) return { count: 0, txs: [] };
   try {
-    const r = await fetch(bridge.url + '/mempool', { signal: AbortSignal.timeout(5000) });
+    const r = await meshFetch(bridge.url + '/mempool', { signal: AbortSignal.timeout(5000) });
     if (!r.ok) return { count: 0, txs: [] };
     return await r.json();
   } catch { return { count: 0, txs: [] }; }
@@ -1429,7 +1442,7 @@ async function discoverBridges() {
   for (const url of SEED_URLS) known.set(url, { name: null, statusUrl: url, pubkeyHex: null });
   for (const url of SEED_URLS) {
     try {
-      const r = await fetch(url + '/discover', { signal: AbortSignal.timeout(5000) });
+      const r = await meshFetch(url + '/discover', { signal: AbortSignal.timeout(5000) });
       if (!r.ok) continue;
       const data = await r.json();
       if (!data.bridges) continue;
@@ -1806,7 +1819,7 @@ async function renderExplorerLiveStream() {
   if (!b) { el.innerHTML = ''; return; }
 
   try {
-    const r = await fetch(b._url + '/mempool', { signal: AbortSignal.timeout(8000) });
+    const r = await meshFetch(b._url + '/mempool', { signal: AbortSignal.timeout(8000) });
     const data = await r.json();
     const txs = data.transactions || [];
     if (txs.length === 0) {
@@ -1872,8 +1885,8 @@ async function lookupAddress(address) {
   // Fetch tx history and inscriptions in parallel
   try {
     const [histRes, inscRes] = await Promise.all([
-      fetch(b._url + '/address/' + address + '/history', { signal: AbortSignal.timeout(15000) }).then(r => r.ok ? r.json() : { history: [] }).catch(() => ({ history: [] })),
-      fetch(b._url + '/inscriptions?address=' + encodeURIComponent(address) + '&limit=50', { signal: AbortSignal.timeout(10000) }).then(r => r.ok ? r.json() : { inscriptions: [], total: 0 }).catch(() => ({ inscriptions: [], total: 0 }))
+      meshFetch(b._url + '/address/' + address + '/history', { signal: AbortSignal.timeout(15000) }).then(r => r.ok ? r.json() : { history: [] }).catch(() => ({ history: [] })),
+      meshFetch(b._url + '/inscriptions?address=' + encodeURIComponent(address) + '&limit=50', { signal: AbortSignal.timeout(10000) }).then(r => r.ok ? r.json() : { inscriptions: [], total: 0 }).catch(() => ({ inscriptions: [], total: 0 }))
     ]);
 
     // Transaction history section
@@ -1954,7 +1967,7 @@ function startAddressScan(address) {
   scanDiv.innerHTML = '<div style="color:var(--text-secondary);font-size:13px">Scanning <span style="font-family:var(--mono);color:var(--accent-blue)">' + escapeHtml(address) + '</span>...</div><div style="margin-top:8px;height:4px;background:var(--bg-input);border-radius:2px;overflow:hidden"><div id="explorerScanBar" style="width:0%;height:100%;background:var(--accent-blue);transition:width 0.3s"></div></div><div id="explorerScanStatus" style="font-size:11px;color:var(--text-muted);margin-top:6px"></div>';
   el.appendChild(scanDiv);
 
-  fetch(b._url + '/scan-address', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address }) })
+  meshFetch(b._url + '/scan-address', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address }) })
   .then(res => {
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -2013,9 +2026,9 @@ async function lookupTx(bridgeUrl) {
   savedExplorerInput = txid;
   try {
     const [txRes, statusRes, proofRes] = await Promise.all([
-      fetch(bridgeUrl + '/tx/' + txid, { signal: AbortSignal.timeout(15000) }),
-      fetch(bridgeUrl + '/tx/' + txid + '/status', { signal: AbortSignal.timeout(5000) }).catch(() => null),
-      fetch(bridgeUrl + '/proof/' + txid, { signal: AbortSignal.timeout(5000) }).catch(() => null)
+      meshFetch(bridgeUrl + '/tx/' + txid, { signal: AbortSignal.timeout(15000) }),
+      meshFetch(bridgeUrl + '/tx/' + txid + '/status', { signal: AbortSignal.timeout(5000) }).catch(() => null),
+      meshFetch(bridgeUrl + '/proof/' + txid, { signal: AbortSignal.timeout(5000) }).catch(() => null)
     ]);
     const data = await txRes.json();
     if (data.error) {
@@ -2622,7 +2635,7 @@ function showRegisterModal(bridgeUrl) {
 }
 async function doRegister(bridgeUrl) {
   document.getElementById('regBtn').disabled = true; document.getElementById('regBtn').textContent = 'Registering...'; document.getElementById('jobLog').style.display = 'block';
-  try { const r = await fetch(bridgeUrl + '/register' + getAuthParam(bridgeUrl), { method: 'POST' }); if (!r.ok) { const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status })); appendJobLog('error', err.error || 'Failed'); return; } const { stream } = await r.json(); streamJob(bridgeUrl + stream); } catch (e) { appendJobLog('error', e.message); }
+  try { const r = await meshFetch(bridgeUrl + '/register' + getAuthParam(bridgeUrl), { method: 'POST' }); if (!r.ok) { const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status })); appendJobLog('error', err.error || 'Failed'); return; } const { stream } = await r.json(); streamJob(bridgeUrl + stream); } catch (e) { appendJobLog('error', e.message); }
 }
 
 function showDeregisterModal(bridgeUrl) {
@@ -2630,7 +2643,7 @@ function showDeregisterModal(bridgeUrl) {
 }
 async function doDeregister(bridgeUrl) {
   const reason = document.getElementById('deregReason').value.trim() || 'shutdown'; document.getElementById('deregBtn').disabled = true; document.getElementById('deregBtn').textContent = 'Deregistering...'; document.getElementById('jobLog').style.display = 'block';
-  try { const r = await fetch(bridgeUrl + '/deregister' + getAuthParam(bridgeUrl), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason }) }); if (!r.ok) { const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status })); appendJobLog('error', err.error || 'Failed'); return; } const { stream } = await r.json(); streamJob(bridgeUrl + stream); } catch (e) { appendJobLog('error', e.message); }
+  try { const r = await meshFetch(bridgeUrl + '/deregister' + getAuthParam(bridgeUrl), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason }) }); if (!r.ok) { const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status })); appendJobLog('error', err.error || 'Failed'); return; } const { stream } = await r.json(); streamJob(bridgeUrl + stream); } catch (e) { appendJobLog('error', e.message); }
 }
 
 function showSendModal(bridgeUrl) {
@@ -2639,7 +2652,7 @@ function showSendModal(bridgeUrl) {
 async function doSend(bridgeUrl) {
   const toAddress = document.getElementById('sendAddress').value.trim(); const amount = parseInt(document.getElementById('sendAmount').value, 10); if (!toAddress) { alert('Enter a destination address'); return; } if (!amount || amount < 546) { alert('Amount must be at least 546 sats'); return; }
   document.getElementById('sendBtn').disabled = true; document.getElementById('sendBtn').textContent = 'Sending...'; document.getElementById('jobLog').style.display = 'block';
-  try { const r = await fetch(bridgeUrl + '/send' + getAuthParam(bridgeUrl), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ toAddress, amount }) }); if (!r.ok) { const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status })); appendJobLog('error', err.error || 'Failed'); return; } const { stream } = await r.json(); streamJob(bridgeUrl + stream); } catch (e) { appendJobLog('error', e.message); }
+  try { const r = await meshFetch(bridgeUrl + '/send' + getAuthParam(bridgeUrl), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ toAddress, amount }) }); if (!r.ok) { const err = await r.json().catch(() => ({ error: 'HTTP ' + r.status })); appendJobLog('error', err.error || 'Failed'); return; } const { stream } = await r.json(); streamJob(bridgeUrl + stream); } catch (e) { appendJobLog('error', e.message); }
 }
 
 function showConnectModal(bridgeUrl) {
@@ -2647,7 +2660,7 @@ function showConnectModal(bridgeUrl) {
 }
 async function doConnect(bridgeUrl) {
   const endpoint = document.getElementById('connectEndpoint').value.trim(); if (!endpoint) return; document.getElementById('connectBtn').disabled = true; document.getElementById('connectBtn').textContent = 'Connecting...';
-  try { const r = await fetch(bridgeUrl + '/connect' + getAuthParam(bridgeUrl), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ endpoint }) }); const data = await r.json(); const el = document.getElementById('connectResult'); el.style.display = 'block'; if (r.ok) { el.innerHTML = '<span style="color:var(--accent-green)">' + data.status + ': ' + data.endpoint + '</span>'; setTimeout(() => pollAll(), 2000); } else { el.innerHTML = '<span style="color:var(--accent-red)">' + (data.error || 'Failed') + '</span>'; } } catch (e) { document.getElementById('connectResult').style.display = 'block'; document.getElementById('connectResult').innerHTML = '<span style="color:var(--accent-red)">' + e.message + '</span>'; }
+  try { const r = await meshFetch(bridgeUrl + '/connect' + getAuthParam(bridgeUrl), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ endpoint }) }); const data = await r.json(); const el = document.getElementById('connectResult'); el.style.display = 'block'; if (r.ok) { el.innerHTML = '<span style="color:var(--accent-green)">' + data.status + ': ' + data.endpoint + '</span>'; setTimeout(() => pollAll(), 2000); } else { el.innerHTML = '<span style="color:var(--accent-red)">' + (data.error || 'Failed') + '</span>'; } } catch (e) { document.getElementById('connectResult').style.display = 'block'; document.getElementById('connectResult').innerHTML = '<span style="color:var(--accent-red)">' + e.message + '</span>'; }
 }
 
 // ── Job SSE streaming ──────────────────────────────
@@ -2775,7 +2788,7 @@ async function startScanAddress(address) {
   el.innerHTML = '<div class="glass" style="padding:12px"><div style="color:var(--text-secondary);font-size:13px">Starting scan for <span style="font-family:var(--mono);color:var(--accent-blue)">' + escapeHtml(address) + '</span>...</div><div id="scanProgressBar" style="margin-top:8px;height:4px;background:var(--bg-input);border-radius:2px;overflow:hidden"><div id="scanBar" style="width:0%;height:100%;background:var(--accent-blue);transition:width 0.3s"></div></div><div id="scanStatus" style="font-size:11px;color:var(--text-muted);margin-top:6px"></div></div>';
 
   try {
-    const res = await fetch(b._url + '/scan-address', {
+    const res = await meshFetch(b._url + '/scan-address', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ address })
@@ -2854,7 +2867,7 @@ async function fetchTokens() {
   el.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:30px">Loading...</div>';
 
   try {
-    const r = await fetch(b._url + '/tokens', { signal: AbortSignal.timeout(10000) });
+    const r = await meshFetch(b._url + '/tokens', { signal: AbortSignal.timeout(10000) });
     const data = await r.json();
     if (data.error) { el.innerHTML = '<div style="color:var(--accent-red);padding:20px">' + escapeHtml(data.error) + '</div>'; return; }
 
@@ -2894,7 +2907,7 @@ async function showTokenDetail(tick) {
   const b = bridgeData.get(selectedBridge);
   if (!b) return;
   try {
-    const r = await fetch(b._url + '/token/' + encodeURIComponent(tick), { signal: AbortSignal.timeout(10000) });
+    const r = await meshFetch(b._url + '/token/' + encodeURIComponent(tick), { signal: AbortSignal.timeout(10000) });
     const tok = await r.json();
     if (tok.error) { alert(tok.error); return; }
 
@@ -2928,7 +2941,7 @@ async function checkTokenBalance(tick) {
   if (!sh || !el) return;
   el.innerHTML = '<span style="color:var(--text-muted)">Checking...</span>';
   try {
-    const r = await fetch(b._url + '/token/' + encodeURIComponent(tick) + '/balance/' + encodeURIComponent(sh), { signal: AbortSignal.timeout(10000) });
+    const r = await meshFetch(b._url + '/token/' + encodeURIComponent(tick) + '/balance/' + encodeURIComponent(sh), { signal: AbortSignal.timeout(10000) });
     const data = await r.json();
     if (data.error) { el.innerHTML = '<span style="color:var(--accent-red)">' + escapeHtml(data.error) + '</span>'; return; }
     el.innerHTML = '<span style="color:var(--accent-green);font-weight:600">' + escapeHtml(String(data.balance || 0)) + '</span> <span style="color:var(--text-muted)">' + escapeHtml(tick) + '</span>';
@@ -3044,7 +3057,7 @@ async function fetchAppsData() {
   const b = bridgeData.get(selectedBridge);
   if (!b) return;
   try {
-    const r = await fetch(b._url + '/apps', { signal: AbortSignal.timeout(10000) });
+    const r = await meshFetch(b._url + '/apps', { signal: AbortSignal.timeout(10000) });
     if (!r.ok) { appsData = []; if (activeTab === 'apps') { const el = document.getElementById('tabContent'); if (el) el.innerHTML = renderAppsTab(); } return; }
     const data = await r.json();
     if (Array.isArray(data)) appsData = data;
@@ -3178,7 +3191,7 @@ async function fetchX402Data() {
   var b = bridgeData.get(selectedBridge);
   if (!b) return;
   try {
-    var r = await fetch(b._url + '/x402' + getAuthParam(b._url), { signal: AbortSignal.timeout(10000) });
+    var r = await meshFetch(b._url + '/x402' + getAuthParam(b._url), { signal: AbortSignal.timeout(10000) });
     if (!r.ok) { x402Data = { enabled: false, endpoints: [] }; if (activeTab === 'x402') { var el = document.getElementById('tabContent'); if (el) el.innerHTML = renderX402Tab(); } return; }
     x402Data = await r.json();
     if (activeTab === 'x402') {
@@ -3222,7 +3235,7 @@ async function saveX402Settings() {
     if (k && !isNaN(v)) endpoints[k] = v;
   }
   try {
-    var r = await fetch(b._url + '/x402' + getAuthParam(b._url), {
+    var r = await meshFetch(b._url + '/x402' + getAuthParam(b._url), {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ enabled: enabled, payTo: payTo, endpoints: endpoints })
@@ -3304,8 +3317,8 @@ async function fetchCrawlerData() {
   if (!b) return;
   try {
     const [healthR, peersR] = await Promise.all([
-      fetch(b._url + '/api/crawler/health', { signal: AbortSignal.timeout(5000) }),
-      fetch(b._url + '/api/crawler/peers', { signal: AbortSignal.timeout(5000) })
+      meshFetch(b._url + '/api/crawler/health', { signal: AbortSignal.timeout(5000) }),
+      meshFetch(b._url + '/api/crawler/peers', { signal: AbortSignal.timeout(5000) })
     ]);
     const health = await healthR.json();
     const peersData = await peersR.json();
@@ -3530,8 +3543,8 @@ async function fetchForestData() {
   for (const [, b] of bridgeData) {
     try {
       const [hR, pR] = await Promise.all([
-        fetch(b._url + '/api/crawler/health', { signal: AbortSignal.timeout(3000) }),
-        fetch(b._url + '/api/crawler/peers', { signal: AbortSignal.timeout(3000) })
+        meshFetch(b._url + '/api/crawler/health', { signal: AbortSignal.timeout(3000) }),
+        meshFetch(b._url + '/api/crawler/peers', { signal: AbortSignal.timeout(3000) })
       ]);
       const health = await hR.json();
       if (health.available) {

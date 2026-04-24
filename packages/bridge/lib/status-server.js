@@ -620,13 +620,15 @@ export class StatusServer {
     // GET /discover — public list of all known bridges in the mesh
     if (req.method === 'GET' && path === '/discover') {
       const bridges = []
+      // Detect protocol from reverse proxy headers (Caddy, nginx) or default to http
+      const proto = req.headers['x-forwarded-proto'] || (req.socket.encrypted ? 'https' : 'http')
       // Add self
       bridges.push({
         name: this._config.name || null,
         pubkeyHex: this._config.pubkeyHex || null,
         endpoint: this._config.endpoint || null,
         meshId: this._config.meshId || null,
-        statusUrl: 'http://' + (req.headers.host || '127.0.0.1:' + this._port) + '/status'
+        statusUrl: proto + '://' + (req.headers.host || '127.0.0.1:' + this._port) + '/status'
       })
       // Add gossip directory (all known peers)
       if (this._gossipManager) {
@@ -648,6 +650,40 @@ export class StatusServer {
       }
       res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
       res.end(JSON.stringify({ count: bridges.length, bridges }))
+      return
+    }
+
+    // GET /mesh/proxy?url=... — proxy requests to other bridges (avoids mixed-content when dashboard is HTTPS)
+    if (req.method === 'GET' && path === '/mesh/proxy') {
+      const targetUrl = url.searchParams.get('url')
+      if (!targetUrl) {
+        res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+        res.end(JSON.stringify({ error: 'Missing url parameter' }))
+        return
+      }
+      // Only allow proxying to read-only mesh endpoints
+      try {
+        const t = new URL(targetUrl)
+        const allowedPrefixes = ['/status', '/mempool', '/discover', '/tx/', '/address/', '/inscriptions', '/tokens', '/token/', '/apps', '/x402', '/proof/', '/api/crawler/', '/health']
+        if (!allowedPrefixes.some(p => t.pathname === p || t.pathname.startsWith(p))) {
+          res.writeHead(403, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+          res.end(JSON.stringify({ error: 'Path not allowed through proxy' }))
+          return
+        }
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+        res.end(JSON.stringify({ error: 'Invalid URL' }))
+        return
+      }
+      try {
+        const proxyRes = await fetch(targetUrl, { signal: AbortSignal.timeout(8000) })
+        const body = await proxyRes.text()
+        res.writeHead(proxyRes.status, { 'Content-Type': proxyRes.headers.get('content-type') || 'application/json', 'Access-Control-Allow-Origin': '*' })
+        res.end(body)
+      } catch (err) {
+        res.writeHead(502, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+        res.end(JSON.stringify({ error: 'Proxy fetch failed', message: err.message }))
+      }
       return
     }
 
