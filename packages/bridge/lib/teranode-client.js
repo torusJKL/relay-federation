@@ -197,7 +197,7 @@ export class TeranodeClient extends EventEmitter {
       statusUpdates: this._statusCount,
       lastBlock: this._lastBlock,
       lastStatus: this._lastStatus,
-      reconnects: this._listener ? this._listener.getReconnectCount() : 0,
+      reconnects: this._listener?.getReconnectCount?.() ?? 0,
       uptime: this._startTime ? Math.floor((Date.now() - this._startTime) / 1000) : 0
     }
   }

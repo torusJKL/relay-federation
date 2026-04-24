@@ -493,7 +493,8 @@ export class StatusServer {
           return
         }
 
-        this._handleRequest(req, res).catch(() => {
+        this._handleRequest(req, res).catch(err => {
+          console.error('[status-server] Request failed:', req.url, err?.message || err)
           res.writeHead(500)
           res.end('Internal Server Error')
         })
