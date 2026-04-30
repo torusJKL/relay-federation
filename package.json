@@ -11,5 +11,5 @@
     "test": "node --test"
   },
   "author": "zcooL",
-  "license": "MIT"
+  "license": "BSL-1.1"
 }

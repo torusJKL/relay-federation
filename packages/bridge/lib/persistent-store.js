@@ -42,7 +42,6 @@ export class PersistentStore extends EventEmitter {
     this._txBlock = null
     this._content = null
     this._tokens = null
-    this._sessions = null
     this._paymentReceipts = null
     this._spentInputs = null
     this._contentDir = join(dataDir, 'content')
@@ -67,7 +66,6 @@ export class PersistentStore extends EventEmitter {
         this._txBlock = this.db.sublevel('txBlock', { valueEncoding: 'json' })
         this._content = this.db.sublevel('content', { valueEncoding: 'json' })
         this._tokens = this.db.sublevel('tokens', { valueEncoding: 'json' })
-        this._sessions = this.db.sublevel('sessions', { valueEncoding: 'json' })
         this._paymentReceipts = this.db.sublevel('payment_receipts', { valueEncoding: 'json' })
         this._spentInputs = this.db.sublevel('spentInputs', { valueEncoding: 'json' })
         await mkdir(this._contentDir, { recursive: true })
@@ -431,107 +429,6 @@ export class PersistentStore extends EventEmitter {
       }
     }
     return matches
-  }
-
-  // ── Sessions (Indelible) ───────────────────────────────────
-
-  /**
-   * Store a session metadata record with sort index.
-   * PK: s!{address}!{txId}  SK: t!{address}!{revTs}!{txId}
-   * @param {object} session — must have txId and address
-   */
-  async putSession (session) {
-    const { txId, address } = session
-    if (!txId || !address) throw new Error('txId and address required')
-    const pk = `s!${address}!${txId}`
-    const ts = session.timestamp || new Date().toISOString()
-    const revTs = String(9999999999999 - new Date(ts).getTime()).padStart(13, '0')
-    const sk = `t!${address}!${revTs}!${txId}`
-    const record = {
-      txId, address,
-      session_id: session.session_id || null,
-      prev_session_id: session.prev_session_id || null,
-      summary: session.summary || '',
-      message_count: session.message_count || 0,
-      save_type: session.save_type || 'full',
-      timestamp: ts,
-      receivedAt: new Date().toISOString()
-    }
-    await this._sessions.batch([
-      { type: 'put', key: pk, value: record },
-      { type: 'put', key: sk, value: txId }
-    ])
-    return record
-  }
-
-  /**
-   * Get sessions for an address, newest first.
-   * @param {string} address
-   * @param {number} [limit=200]
-   * @returns {Promise<Array>}
-   */
-  async getSessions (address, limit = 200) {
-    const prefix = `t!${address}!`
-    const results = []
-    for await (const [, txId] of this._sessions.iterator({
-      gte: prefix, lt: prefix + '~', limit
-    })) {
-      const record = await this._safeGet(this._sessions, `s!${address}!${txId}`)
-      if (record) results.push(record)
-    }
-    return results
-  }
-
-  /**
-   * Batch import sessions (for backfill).
-   * @param {Array} sessions — array of session objects
-   * @returns {Promise<number>} count imported
-   */
-  async putSessionsBatch (sessions) {
-    const ops = []
-    for (const session of sessions) {
-      const { txId, address } = session
-      if (!txId || !address) continue
-      const pk = `s!${address}!${txId}`
-      const ts = session.timestamp || new Date().toISOString()
-      const revTs = String(9999999999999 - new Date(ts).getTime()).padStart(13, '0')
-      const sk = `t!${address}!${revTs}!${txId}`
-      const record = {
-        txId, address,
-        session_id: session.session_id || null,
-        prev_session_id: session.prev_session_id || null,
-        summary: session.summary || '',
-        message_count: session.message_count || 0,
-        save_type: session.save_type || 'full',
-        timestamp: ts,
-        receivedAt: new Date().toISOString()
-      }
-      ops.push({ type: 'put', key: pk, value: record })
-      ops.push({ type: 'put', key: sk, value: txId })
-    }
-    if (ops.length > 0) await this._sessions.batch(ops)
-    return ops.length / 2
-  }
-
-  /**
-   * Get summary of all addresses with sessions (for peer sync announce).
-   * @returns {Promise<Array<{ address: string, count: number, latest: string }>>}
-   */
-  async getSessionAddresses () {
-    const map = new Map() // address → { count, latest }
-    for await (const [key, value] of this._sessions.iterator({
-      gte: 's!', lt: 's!~'
-    })) {
-      const addr = key.split('!')[1]
-      const entry = map.get(addr)
-      if (!entry) {
-        map.set(addr, { count: 1, latest: value.timestamp || '' })
-      } else {
-        entry.count++
-        if (value.timestamp > entry.latest) entry.latest = value.timestamp
-      }
-    }
-    return [...map].map(([address, { count, latest }]) => ({ address, count, latest }))
   }
 
   // ── Metadata ─────────────────────────────────────────────

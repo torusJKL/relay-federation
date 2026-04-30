@@ -6,7 +6,6 @@ import { PeerManager } from './lib/peer-manager.js'
 import { HeaderRelay } from './lib/header-relay.js'
 import { TxRelay } from './lib/tx-relay.js'
 import { DataRelay } from './lib/data-relay.js'
-import { SessionRelay } from './lib/session-relay.js'
 import { StatusServer } from './lib/status-server.js'
 // network.js import removed — register/deregister now use local UTXOs + P2P broadcast
 
@@ -483,7 +482,6 @@ async function cmdStart () {
   const headerRelay = new HeaderRelay(peerManager)
   const txRelay = new TxRelay(peerManager, { bridgeName: config.name })
   const dataRelay = new DataRelay(peerManager)
-  const sessionRelay = new SessionRelay(peerManager, store)
 
   // ── 2b. Phase 2: Security layer ────────────────────────────
   const { PeerScorer } = await import('./lib/peer-scorer.js')

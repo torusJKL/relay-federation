@@ -14,8 +14,7 @@ import { BSVPeer } from './bsv-peer.js'
  * - Fetches transactions from first available peer
  * - Maintains peer pool with periodic health checks
  *
- * Ported from production Indelible SPV bridge (spv-client.js)
- * peer management, adapted for the open protocol (no third-party APIs).
+ * Adapted for the open protocol (no third-party APIs).
  *
  * Events (proxied from all peers):
  *   'headers'      — { headers, count }

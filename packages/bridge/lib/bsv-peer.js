@@ -11,7 +11,6 @@ import { createHash, randomBytes } from 'node:crypto'
  * - Transaction fetch via getdata MSG_TX
  * - Keepalive via ping/pong
  *
- * Ported from production Indelible SPV bridge (p2p.js) with:
  * - Protocol version 70016 with protoconf
  * - User agent /Bitcoin SV:1.1.0/ (matches known clients)
  * - Correct inv-based broadcast (not raw tx push)
