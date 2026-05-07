@@ -7,3 +7,17 @@ Thumbs.db
 coverage/
 .nyc_output/
 *.tgz
+
+# Indelible-private files — must NEVER be committed to public repo.
+# These belong in c:/Indelible-main/bridge/ (private repo) only.
+# Deleted from public dir 2026-05-03 after April 30 separation cleanup.
+packages/bridge/heartbeat.mjs
+packages/bridge/telegram-bot.mjs
+packages/bridge/replay-to-arc.js
+packages/bridge/briefing.md
+
+# Pull-from-live snapshots used during pull-live-first deploy discipline.
+# These are scratch files, not source.
+packages/bridge/cli.js.*-live
+packages/bridge/cli.js.alpha-good
+packages/bridge/cli.js.*.bak.*

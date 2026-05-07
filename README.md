@@ -12,7 +12,7 @@ We built the same thing for Bitcoin.
 
 **Transactions are the nutrients.** Broadcast to one bridge, and they propagate through the mesh to the entire BSV network.
 
-**8 bridges live. 422 tests passing. 2 continents.**
+**9 bridges live. 422 tests passing. 2 continents.**
 
 ---
 
@@ -39,14 +39,15 @@ No full node. No third-party API. No single point of failure.
 
 | Bridge | Location | BSV Peers | Teranode | Novel Relay | Role |
 |--------|----------|-----------|----------|-------------|------|
-| 1 | Dallas, TX | 12-18 | 1 peer | 98% hit rate | General |
-| 2 | New Jersey | 17-20 | 1 peer | 98% hit rate | General |
-| 3 | Chicago, IL | 4-6 | 1 peer | 98% hit rate | General |
-| 4 | Dallas, TX | 3-20 | 1 peer | 98% hit rate | General |
-| 5 | Atlanta, GA | 4-20 | 1 peer | 98% hit rate | General |
-| 6 | Silicon Valley | 3-5 | 1 peer | 98% hit rate | General |
-| 7 | Silicon Valley | 4-7 | 1 peer | 98% hit rate | DNS seed crawler |
-| 8 | Helsinki, FI | 4+ | 1 peer | — | Community operator |
+| 1 | Dallas, TX | 14-32 | 1 peer | 98% hit rate | General |
+| 2 | New Jersey | 18-32 | 1 peer | 98% hit rate | General |
+| 3 | Chicago, IL | 18-32 | 1 peer | 98% hit rate | General |
+| 4 | Dallas, TX | 14-32 | 1 peer | 98% hit rate | General |
+| 5 | Atlanta, GA | 22-32 | 1 peer | 98% hit rate | General |
+| 6 | Silicon Valley | 32 | 1 peer | 98% hit rate | General |
+| 7 | Silicon Valley | 25-32 | 1 peer | 98% hit rate | DNS seed crawler |
+| 8 | Hetzner (EU) | 6+ | 1 peer | — | Community operator |
+| 9 | bitspv.com | 5+ | 1 peer | — | Community operator |
 
 All bridges registered on-chain with 1M sat Surety bond. All managed by systemd. All running `NODE_OPTIONS='--max-old-space-size=2048'`.
 
@@ -141,7 +142,7 @@ Transactions enter through ARC (HTTP POST to Teranode). Bridges hear them come b
 
 | # | Pipe | Transport | Direction | Status |
 |---|------|-----------|-----------|--------|
-| 1 | **Teranode gossip** | libp2p GossipSub | Blocks, subtrees, status IN | Live — all 7 bridges |
+| 1 | **Teranode gossip** | libp2p GossipSub | Blocks, subtrees, status IN | Live — all 9 bridges |
 | 2 | **ARC** | HTTP POST | Transactions OUT to miners | Live |
 | 3 | **Legacy BSV P2P** | TCP wire protocol | Headers, txs, both directions | Live — ban-prone |
 | 4 | **Federation mesh** | WebSocket peering | Tx relay between bridges | Live |
@@ -154,7 +155,7 @@ Any one goes down, the others keep feeding. All different transport types — no
 | Port | Protocol | What It Does |
 |------|----------|-------------|
 | **8333** | TCP (Bitcoin P2P) | Outbound + inbound connections to BSV full nodes. Standard Bitcoin port. |
-| **18333** | WebSocket | Bridge-to-bridge mesh: cryptographic handshake, tx relay, header sync, data envelopes, session sync. |
+| **18333** | WebSocket | Bridge-to-bridge mesh: cryptographic handshake, tx relay, header sync, data envelopes. |
 | **9333** | HTTP | REST API for apps, operator dashboard, x402 payments. |
 
 ---
@@ -280,7 +281,6 @@ Optional HTTP 402-based micropayment layer. The two-sided flywheel that makes th
 - **Inscription indexing** — ordinal inscriptions with content-addressed storage
 - **BSV-20 tokens** — deploy/mint/transfer tracking, balance queries
 - **Protocol parsing** — P2PKH, OP_RETURN, ordinals, B://, BCAT, MAP, MetaNet, BSV-20
-- **Session storage** — Indelible session metadata with cross-mesh sync via SessionRelay
 - **Data envelope relay** — signed, TTL-bounded, topic-routed ephemeral data across the mesh
 - **x402 micropayments** — free reads, paid writes, per-endpoint pricing
 - **Price feed** — live BSV/USD

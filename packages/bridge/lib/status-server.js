@@ -62,6 +62,14 @@ export class StatusServer {
     this._startedAt = Date.now()
     this._server = null
 
+    // Cleanup lifecycle (g-Gamma-flap-fix 2026-05-04):
+    // _isShuttingDown is checked inside cleanup() to break out of the for-await
+    // loop immediately on shutdown. _activeCleanup tracks the in-flight promise
+    // so stop() can await it before letting the caller close the LevelDB.
+    this._isShuttingDown = false
+    this._activeCleanup = null
+    this._txCleanupInterval = null
+
     // Job system for async actions (register, deregister)
     this._jobs = new Map()
     this._jobCounter = 0
@@ -395,11 +403,15 @@ export class StatusServer {
     const BATCH_SIZE = 50 // check 50 txs per cycle to avoid hammering ARC
 
     const cleanup = async () => {
+      // g-Gamma-flap-fix: bail before starting if shutdown began
+      if (this._isShuttingDown) return
+
       // Pass 1: Delete confirmed raw tx hex (existing behavior)
       try {
         let checked = 0
         let deleted = 0
         for await (const txid of this._store.listTxIds()) {
+          if (this._isShuttingDown) break  // ← break the iterator on shutdown
           if (checked >= BATCH_SIZE) break
           checked++
           try {
@@ -410,6 +422,7 @@ export class StatusServer {
               const data = await arcRes.json().catch(() => null)
               // ARC returns txStatus: 'SEEN_ON_NETWORK' or 'MINED' etc.
               if (data && (data.txStatus === 'MINED' || data.blockHeight > 0)) {
+                if (this._isShuttingDown) break  // last-second guard before db write
                 await this._store.deleteTx(txid)
                 deleted++
               }
@@ -420,8 +433,11 @@ export class StatusServer {
           console.log(`[tx-cleanup] Deleted ${deleted}/${checked} confirmed txs from PersistentStore`)
         }
       } catch (e) {
-        console.error('[tx-cleanup] Error:', e.message)
+        // Suppress iterator/db errors that happen during shutdown — they're expected
+        if (!this._isShuttingDown) console.error('[tx-cleanup] Error:', e.message)
       }
+
+      if (this._isShuttingDown) return
 
       // Pass 2: Prune ghost UTXOs — unconfirmed UTXO txids that never got mined
       try {
@@ -430,6 +446,7 @@ export class StatusServer {
         let utxosChecked = 0
 
         for (const txid of utxoTxIds) {
+          if (this._isShuttingDown) break
           if (utxosChecked >= BATCH_SIZE) break
           utxosChecked++
           try {
@@ -443,8 +460,10 @@ export class StatusServer {
               }
             }
             // Not mined — delete all UTXOs from this txid
+            if (this._isShuttingDown) break
             const utxos = await this._store.getUnspentByTxId(txid)
             for (const u of utxos) {
+              if (this._isShuttingDown) break
               await this._store.deleteUtxo(u.txid, u.vout)
               ghostsDeleted++
             }
@@ -454,24 +473,34 @@ export class StatusServer {
           console.log(`[utxo-cleanup] Pruned ${ghostsDeleted} ghost UTXOs from ${utxosChecked} unconfirmed txids`)
         }
       } catch (e) {
-        console.error('[utxo-cleanup] Error:', e.message)
+        if (!this._isShuttingDown) console.error('[utxo-cleanup] Error:', e.message)
       }
     }
 
     // First run after 60s (let bridge stabilize), then every 5 minutes
     setTimeout(() => {
-      cleanup()
-      this._txCleanupInterval = setInterval(cleanup, CLEANUP_INTERVAL)
+      this._activeCleanup = cleanup()
+      this._txCleanupInterval = setInterval(() => {
+        // Track the latest run so stop() can await it
+        this._activeCleanup = cleanup()
+      }, CLEANUP_INTERVAL)
     }, 60000)
   }
 
   /**
-   * Stop background tx cleanup.
+   * Stop background tx cleanup. Now async — waits for any in-flight cleanup
+   * to break out of its loop before returning, so the caller can safely close
+   * the underlying database without orphaning iterators.
    */
-  stopTxCleanup () {
+  async stopTxCleanup () {
+    this._isShuttingDown = true
     if (this._txCleanupInterval) {
       clearInterval(this._txCleanupInterval)
       this._txCleanupInterval = null
+    }
+    if (this._activeCleanup) {
+      try { await this._activeCleanup } catch {} // swallow any iterator-after-close
+      this._activeCleanup = null
     }
   }
 
@@ -634,11 +663,11 @@ export class StatusServer {
       // Add gossip directory (all known peers)
       if (this._gossipManager) {
         for (const peer of this._gossipManager.getDirectory()) {
-          // Derive statusUrl from ws endpoint: ws://host:8333 → http://host:9333
+          // statusPort is decoupled from gossip port — default 9333 unless peer advertised otherwise
           let statusUrl = null
           try {
             const u = new URL(peer.endpoint)
-            const statusPort = parseInt(u.port, 10) + 1000
+            const statusPort = peer.statusPort || 9333
             statusUrl = 'http://' + u.hostname + ':' + statusPort + '/status'
           } catch {}
           bridges.push({
@@ -2018,8 +2047,12 @@ export class StatusServer {
    * Stop the HTTP server.
    * @returns {Promise<void>}
    */
-  stop () {
+  async stop () {
     this.stopAppMonitoring()
+    // g-Gamma-flap-fix: stop tx cleanup BEFORE closing HTTP — and wait for
+    // any in-flight iteration to break out, so the caller's subsequent
+    // store.close() doesn't orphan a LevelDB iterator and spam errors.
+    await this.stopTxCleanup()
     return new Promise((resolve) => {
       if (this._server) {
         this._server.close(() => resolve())
